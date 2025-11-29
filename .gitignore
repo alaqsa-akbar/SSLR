@@ -1,0 +1,6 @@
+venv/
+data/
+models/
+visualizations/
+output/
+runs/
