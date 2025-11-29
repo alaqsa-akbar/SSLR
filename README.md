@@ -1,23 +1,11 @@
-# Sign Language Recognition Project
+# Saudi Sign Language Recognition (SSLR)
 
-This project implements a Sign Language Recognition model using a **Pose Encoder** and a **UMT5 Text Encoder/Decoder**. It translates sequences of pose keypoints into text glosses.
-
-## Key Features
-
-*   **Advanced Pose Encoder**:
-    *   **Spatial GCN**: Graph Convolutional Network to aggregate features based on skeletal connectivity (Body, Hands, Face).
-    *   **RoPE (Rotary Positional Embeddings)**: For robust relative position modeling.
-    *   **RMSNorm**: For improved training stability.
-    *   **Flash Attention**: Uses PyTorch's optimized `F.scaled_dot_product_attention` (SDPA).
-*   **Robust Data Handling**:
-    *   **Dynamic Normalization**: Automatically scales inputs to `[0, 1]` based on the maximum value per sample, handling varying resolutions.
-    *   **Dynamic Cache**: RoPE cache resizes automatically to the input sequence length.
-*   **Configuration**: Hyperparameters managed via `configs/pose_encoder_config.json`.
+This project implements a **Saudi Sign Language Recognition** model using the **Isharah** dataset. It utilizes a **Pose Encoder** with a Spatial GCN and a **UMT5 Text Encoder/Decoder** to translate sequences of pose keypoints into text glosses.
 
 ## Project Structure
 
 - `configs/`: Configuration files (`pose_encoder_config.json`).
-- `data/`: Dataset files (downloaded via script).
+- `data/`: Dataset files (Isharah dataset).
 - `models/`:
     - `umt5/`: Pretrained UMT5 model files.
 - `modules/`:
@@ -40,7 +28,7 @@ This project implements a Sign Language Recognition model using a **Pose Encoder
     ```
 
 2.  **Download Resources**:
-    This script downloads the UMT5 model and your dataset from Hugging Face.
+    This script downloads the UMT5 model and the Isharah dataset from Hugging Face.
     ```bash
     python download_resources.py --dataset_repo_id <YOUR_HF_USERNAME>/<DATASET_NAME>
     ```
@@ -93,19 +81,3 @@ python inference.py \
     --input_file data/data.pkl \
     --sample_id <YOUR_SAMPLE_ID>
 ```
-
-## External Training Guide (RunPod/Vast.ai)
-
-To train on a remote GPU instance:
-
-1.  **Zip the Project**: Compress the entire folder (exclude `venv`, `__pycache__`, `runs`, `output`).
-2.  **Upload**: Transfer the zip file to your instance.
-3.  **Install & Download**:
-    ```bash
-    unzip project.zip
-    cd project
-    pip install -r requirements.txt
-    python download_resources.py --dataset_repo_id <YOUR_REPO_ID>
-    ```
-4.  **Run Training**: Execute the training commands listed above.
-5.  **Retrieve Results**: Download the `output/` folder back to your local machine for evaluation.
