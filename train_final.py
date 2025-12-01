@@ -8,6 +8,7 @@ from tqdm import tqdm
 import os
 import argparse
 from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 class SignLanguageModel(nn.Module):
     def __init__(self, pose_encoder, umt5_model):
@@ -20,8 +21,11 @@ class SignLanguageModel(nn.Module):
         pose_embeddings = self.pose_encoder(pose, attention_mask=pose_attention_mask) # (B, T, H)
         
         # UMT5 Decoder
+        from transformers.modeling_outputs import BaseModelOutput
+        encoder_outputs = BaseModelOutput(last_hidden_state=pose_embeddings)
+        
         outputs = self.umt5_model(
-            encoder_outputs=(pose_embeddings,),
+            encoder_outputs=encoder_outputs,
             attention_mask=pose_attention_mask,
             labels=labels,
             decoder_attention_mask=decoder_attention_mask
@@ -39,7 +43,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
-    parser.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients before update")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (for tracking only, no break)")
     parser.add_argument("--max_frames", type=int, default=None, help="Max frames for dataset (default: None, calculated from data)")
     parser.add_argument("--pose_config", type=str, default="configs/pose_encoder_config.json", help="Path to Pose Encoder config file")
     
@@ -53,6 +58,9 @@ def train():
     
     # Tensorboard Writer
     writer = SummaryWriter(log_dir=args.log_dir)
+    
+    # Initialize WandB
+    wandb.init(project="sign-language-translation", name="final-model-training", config=args)
     
     # Paths
     train_csv = os.path.join(args.data_dir, "train.csv")
@@ -81,6 +89,11 @@ def train():
                 print("Local config not found, using 'google/umt5-base' config")
                 config = UMT5Config.from_pretrained("google/umt5-base")
             
+            if config.d_model != 768:
+                print(f"Warning: Loaded config has d_model={config.d_model}, forcing 768 and vocab 256384")
+                config.d_model = 768
+                config.vocab_size = 256384
+            
             umt5_model = UMT5ForConditionalGeneration(config)
             state_dict = torch.load(umt5_weights_path, map_location="cpu")
             umt5_model.load_state_dict(state_dict, strict=False)
@@ -89,8 +102,26 @@ def train():
             umt5_model = UMT5ForConditionalGeneration.from_pretrained("google/umt5-base")
     except Exception as e:
         print(f"Error loading UMT5: {e}")
-        config = UMT5Config.from_pretrained("google/umt5-base") if os.path.exists("google/umt5-base") else UMT5Config()
+        print("Attempting to create manual UMT5-Base config...")
+        config = UMT5Config(
+            vocab_size=256384,
+            d_model=768,
+            d_kv=64,
+            d_ff=2048,
+            num_layers=12,
+            num_heads=12,
+            relative_attention_num_buckets=32,
+            dropout_rate=0.1,
+            layer_norm_epsilon=1e-6,
+            initializer_factor=1.0,
+            feed_forward_proj="gated-gelu",
+            is_encoder_decoder=True
+        )
         umt5_model = UMT5ForConditionalGeneration(config)
+        
+    # Enable Gradient Checkpointing
+    print("Enabling Gradient Checkpointing for UMT5...")
+    umt5_model.gradient_checkpointing_enable()
         
     # Datasets
     print("Loading Datasets...")
@@ -119,18 +150,35 @@ def train():
     # Try to find latest checkpoint
     checkpoint_path = None
     if os.path.exists(args.contrastive_model_dir):
+        # Check for checkpoint subdirectories
         checkpoints = [d for d in os.listdir(args.contrastive_model_dir) if d.startswith("checkpoint-")]
         if checkpoints:
             # Sort by epoch number
             checkpoints.sort(key=lambda x: int(x.split("-")[1]))
             checkpoint_path = os.path.join(args.contrastive_model_dir, checkpoints[-1])
+        # Fallback: Check if the directory itself contains the model (saved at end of training)
+        elif os.path.exists(os.path.join(args.contrastive_model_dir, "config.json")):
+            checkpoint_path = args.contrastive_model_dir
     
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Loading pretrained Pose Encoder from {checkpoint_path}")
         try:
             pose_encoder = PoseEncoder.from_pretrained(checkpoint_path)
         except Exception as e:
-            print(f"Failed to load pretrained pose encoder: {e}")
+            print(f"Failed to load pretrained pose encoder using standard method: {e}")
+            # Manual fallback for safetensors if standard method fails
+            try:
+                if os.path.exists(os.path.join(checkpoint_path, "model.safetensors")):
+                    from safetensors.torch import load_file
+                    state_dict = load_file(os.path.join(checkpoint_path, "model.safetensors"))
+                    pose_encoder = PoseEncoder(PoseEncoderConfig.from_pretrained(checkpoint_path))
+                    pose_encoder.load_state_dict(state_dict)
+                    print("Successfully loaded model.safetensors manually.")
+                else:
+                    raise e
+            except Exception as e2:
+                print(f"Failed to load pretrained pose encoder: {e2}")
+                print("Training Pose Encoder from scratch.")
     else:
         print("Warning: No contrastive checkpoint found. Training Pose Encoder from scratch.")
 
@@ -141,13 +189,23 @@ def train():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
+    # Scheduler
+    from transformers import get_linear_schedule_with_warmup
+    num_training_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
+    num_warmup_steps = int(0.1 * num_training_steps) # 10% warmup
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
+    
+    # Early Stopping variables
+    best_val_loss = float('inf')
+    
     print("Starting Training...")
     global_step = 0
     for epoch in range(args.epochs):
+        # --- Training ---
         model.train()
         total_loss = 0
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]"):
             # Move to device
             pose = batch['pose'].to(device)
             pose_mask = batch['pose_attention_mask'].to(device)
@@ -157,27 +215,67 @@ def train():
             labels = input_ids.clone()
             labels[labels == tokenizer.pad_token_id] = -100
             
+            optimizer.zero_grad()
+            
+            # Standard Forward Pass (No AMP)
             outputs = model(pose, pose_mask, labels=labels)
             loss = outputs.loss
             
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # Normalize loss
+            loss = loss / args.gradient_accumulation_steps
             
-            total_loss += loss.item()
-            writer.add_scalar("Loss/train", loss.item(), global_step)
+            # Backward pass without scaler
+            loss.backward()
+            
+            if (global_step + 1) % args.gradient_accumulation_steps == 0:
+                # Gradient Clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+            
+            total_loss += loss.item() * args.gradient_accumulation_steps
+            writer.add_scalar("Loss/train", loss.item() * args.gradient_accumulation_steps, global_step)
+            wandb.log({"train_loss": loss.item() * args.gradient_accumulation_steps, "epoch": epoch, "global_step": global_step})
             global_step += 1
             
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1} Loss: {avg_loss:.4f}")
+        avg_train_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
         
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
-            print(f"Saving checkpoint at epoch {epoch+1}")
-            save_dir = os.path.join(args.output_dir, f"checkpoint-{epoch+1}")
-            os.makedirs(save_dir, exist_ok=True)
-            model.pose_encoder.save_pretrained(os.path.join(save_dir, "pose_encoder"))
-            model.umt5_model.save_pretrained(os.path.join(save_dir, "umt5"))
+        # --- Validation ---
+        model.eval()
+        total_val_loss = 0
+        print("Running Validation...")
+        with torch.no_grad():
+            for batch in tqdm(dev_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]"):
+                pose = batch['pose'].to(device)
+                pose_mask = batch['pose_attention_mask'].to(device)
+                input_ids = batch['input_ids'].to(device)
+                
+                labels = input_ids.clone()
+                labels[labels == tokenizer.pad_token_id] = -100
+                
+                outputs = model(pose, pose_mask, labels=labels)
+                loss = outputs.loss
+                
+                total_val_loss += loss.item()
+        
+        avg_val_loss = total_val_loss / len(dev_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
+        writer.add_scalar("Loss/val", avg_val_loss, epoch)
+        wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
+        
+        # --- Saving Best Model ---
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            print(f"New best validation loss! Saving model to {args.output_dir}")
+            
+            # Save Best Model
+            model.pose_encoder.save_pretrained(os.path.join(args.output_dir, "pose_encoder"))
+            model.umt5_model.save_pretrained(os.path.join(args.output_dir, "umt5"))
+        else:
+            print(f"No improvement in validation loss.")
         
     writer.close()
 

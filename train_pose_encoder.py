@@ -8,6 +8,7 @@ from tqdm import tqdm
 import os
 import argparse
 from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Pose Encoder with Contrastive Learning")
@@ -18,7 +19,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
-    parser.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients before update")
     parser.add_argument("--max_frames", type=int, default=None, help="Max frames for dataset (default: None, calculated from data)")
     parser.add_argument("--pose_config", type=str, default="configs/pose_encoder_config.json", help="Path to Pose Encoder config file")
     
@@ -32,6 +33,9 @@ def train():
     
     # Tensorboard Writer
     writer = SummaryWriter(log_dir=args.log_dir)
+    
+    # Initialize WandB
+    wandb.init(project="sign-language-translation", name="pose-encoder-pretrain", config=args)
     
     # Paths
     train_csv = os.path.join(args.data_dir, "train.csv")
@@ -61,6 +65,11 @@ def train():
                 print("Local config not found, using 'google/umt5-base' config")
                 config = UMT5Config.from_pretrained("google/umt5-base")
             
+            if config.d_model != 768:
+                print(f"Warning: Loaded config has d_model={config.d_model}, forcing 768 and vocab 256384")
+                config.d_model = 768
+                config.vocab_size = 256384
+            
             text_encoder = UMT5EncoderModel(config)
             state_dict = torch.load(umt5_weights_path, map_location="cpu")
             text_encoder.load_state_dict(state_dict, strict=False)
@@ -69,8 +78,21 @@ def train():
             text_encoder = UMT5EncoderModel.from_pretrained("google/umt5-base")
     except Exception as e:
         print(f"Error loading UMT5: {e}")
-        print("Initializing random UMT5 (WARNING: Contrastive learning will fail to align to language if text encoder is random)")
-        config = UMT5Config.from_pretrained("google/umt5-base") if os.path.exists("google/umt5-base") else UMT5Config()
+        print("Attempting to create manual UMT5-Base config...")
+        config = UMT5Config(
+            vocab_size=256384,
+            d_model=768,
+            d_kv=64,
+            d_ff=2048,
+            num_layers=12,
+            num_heads=12,
+            relative_attention_num_buckets=32,
+            dropout_rate=0.1,
+            layer_norm_epsilon=1e-6,
+            initializer_factor=1.0,
+            feed_forward_proj="gated-gelu",
+            is_encoder_decoder=True
+        )
         text_encoder = UMT5EncoderModel(config)
 
     text_encoder.to(device)
@@ -101,11 +123,19 @@ def train():
     # Optimizer
     optimizer = torch.optim.AdamW(pose_encoder.parameters(), lr=args.lr)
     
+    # Scheduler
+    from transformers import get_linear_schedule_with_warmup
+    num_training_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
+    num_warmup_steps = int(0.1 * num_training_steps) # 10% warmup
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
+    
     # Loss Function (Contrastive)
     cross_entropy_loss = nn.CrossEntropyLoss()
     
     print("Starting Training...")
     global_step = 0
+    # Define temperature for contrastive loss (example value, adjust as needed)
+    temperature = 0.07 
     for epoch in range(args.epochs):
         pose_encoder.train()
         total_loss = 0
@@ -116,6 +146,8 @@ def train():
             pose_mask = batch['pose_attention_mask'].to(device) # (B, T_pose)
             input_ids = batch['input_ids'].to(device) # (B, T_text)
             attention_mask = batch['attention_mask'].to(device) # (B, T_text)
+            
+            optimizer.zero_grad()
             
             # Forward Pose Encoder
             pose_embeddings = pose_encoder(pose, attention_mask=pose_mask) # (B, T_pose, H)
@@ -138,34 +170,37 @@ def train():
             text_counts = torch.clamp(text_mask_expanded.sum(1), min=1e-9)
             text_rep = text_sum / text_counts # (B, H)
             
-            # Normalize
-            pose_rep = nn.functional.normalize(pose_rep, p=2, dim=1)
-            text_rep = nn.functional.normalize(text_rep, p=2, dim=1)
+            # MSE Loss
+            # The user prefers exact vector matching since these embeddings will be input to the decoder.
+            # MSE forces the model to match both direction and magnitude.
+            mse_loss = nn.MSELoss()
+            loss = mse_loss(pose_rep, text_rep)
             
-            # Contrastive Loss (InfoNCE / CLIP)
-            temperature = 0.07
-            logits = torch.matmul(pose_rep, text_rep.T) / temperature # (B, B)
+            # Normalize loss to account for accumulation
+            loss = loss / args.gradient_accumulation_steps
             
-            labels = torch.arange(logits.size(0), device=device)
-            loss_i = cross_entropy_loss(logits, labels)
-            loss_t = cross_entropy_loss(logits.T, labels)
-            loss = (loss_i + loss_t) / 2
-            
-            optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
             
-            total_loss += loss.item()
-            writer.add_scalar("Loss/train", loss.item(), global_step)
+            if (global_step + 1) % args.gradient_accumulation_steps == 0:
+                # Gradient Clipping
+                torch.nn.utils.clip_grad_norm_(pose_encoder.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+            
+            # Scale back up for logging
+            total_loss += loss.item() * args.gradient_accumulation_steps
+            writer.add_scalar("Loss/train", loss.item() * args.gradient_accumulation_steps, global_step)
+            wandb.log({"train_loss": loss.item() * args.gradient_accumulation_steps, "epoch": epoch, "global_step": global_step})
             global_step += 1
             
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1} Loss: {avg_loss:.4f}")
-        
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
-            print(f"Saving checkpoint at epoch {epoch+1}")
-            pose_encoder.save_pretrained(os.path.join(args.output_dir, f"checkpoint-{epoch+1}"))
+            
+    # Save at the end
+    print(f"Saving final model to {args.output_dir}")
+    pose_encoder.save_pretrained(args.output_dir)
         
     writer.close()
 

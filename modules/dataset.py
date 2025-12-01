@@ -37,12 +37,27 @@ class SignLanguageDataset(Dataset):
         else:
             pose = np.zeros((10, 86, 2), dtype=np.float32)
             
-        # Dynamic Normalization
-        # Normalize by the max value in this specific sample to map to [0, 1]
-        # This handles different resolutions (e.g. 256x256 vs 1920x1080)
-        max_val = np.max(pose)
-        if max_val > 1e-6:
-            pose = pose / max_val
+        # Robust Normalization (0-centered, aspect ratio preserved)
+        # 1. Center the pose
+        # We use the bounding box center of the current frame or the whole sequence
+        # Here we center the whole sequence based on its global min/max
+        min_x, min_y = np.min(pose[:, :, 0]), np.min(pose[:, :, 1])
+        max_x, max_y = np.max(pose[:, :, 0]), np.max(pose[:, :, 1])
+        
+        center_x = (min_x + max_x) / 2
+        center_y = (min_y + max_y) / 2
+        
+        pose[:, :, 0] -= center_x
+        pose[:, :, 1] -= center_y
+        
+        # 2. Scale to [-1, 1] preserving aspect ratio
+        # We divide by the maximum dimension (width or height)
+        width = max_x - min_x
+        height = max_y - min_y
+        scale = max(width, height) / 2.0 # Divide by half to map to [-1, 1]
+        
+        if scale > 1e-6:
+            pose = pose / scale
             
         pose = torch.tensor(pose, dtype=torch.float32)
         

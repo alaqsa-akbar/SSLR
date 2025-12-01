@@ -8,8 +8,10 @@ from tqdm import tqdm
 import os
 import argparse
 import sacrebleu
+from sacrebleu.metrics import BLEU
 import pandas as pd
 import pickle
+import jiwer
 
 from transformers.modeling_outputs import BaseModelOutput
 
@@ -47,7 +49,7 @@ def parse_args():
     parser.add_argument("--output_file", type=str, default="evaluation_results.txt", help="Path to save results")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for evaluation")
     parser.add_argument("--max_frames", type=int, default=1000, help="Max frames for input")
-    parser.add_argument("--pose_config", type=str, default="models/pose_encoder_config.json", help="Path to Pose Encoder config file")
+    parser.add_argument("--pose_config", type=str, default="configs/pose_encoder_config.json", help="Path to Pose Encoder config file")
     
     return parser.parse_args()
 
@@ -81,6 +83,9 @@ def load_model(args, device):
         pose_encoder = PoseEncoder(pose_config)
         if os.path.exists(os.path.join(pose_encoder_path, "pytorch_model.bin")):
             pose_encoder.load_state_dict(torch.load(os.path.join(pose_encoder_path, "pytorch_model.bin")))
+        elif os.path.exists(os.path.join(pose_encoder_path, "model.safetensors")):
+            from safetensors.torch import load_file
+            pose_encoder.load_state_dict(load_file(os.path.join(pose_encoder_path, "model.safetensors")))
 
     # Load UMT5
     umt5_path = os.path.join(checkpoint_path, "umt5")
@@ -92,6 +97,9 @@ def load_model(args, device):
         umt5_model = UMT5ForConditionalGeneration(config)
         if os.path.exists(os.path.join(umt5_path, "pytorch_model.bin")):
              umt5_model.load_state_dict(torch.load(os.path.join(umt5_path, "pytorch_model.bin")))
+        elif os.path.exists(os.path.join(umt5_path, "model.safetensors")):
+            from safetensors.torch import load_file
+            umt5_model.load_state_dict(load_file(os.path.join(umt5_path, "model.safetensors")))
 
     model = SignLanguageModel(pose_encoder, umt5_model)
     model.to(device)
@@ -142,19 +150,26 @@ def evaluate():
             references.extend(decoded_refs)
             
     # Calculate BLEU Scores
-    # BLEU-1 (1-gram)
-    bleu1 = sacrebleu.corpus_bleu(predictions, [references], weights=[1.0, 0.0, 0.0, 0.0])
-    # BLEU-2 (1-gram, 2-gram)
-    bleu2 = sacrebleu.corpus_bleu(predictions, [references], weights=[0.5, 0.5, 0.0, 0.0])
-    # BLEU-3 (1-gram, 2-gram, 3-gram)
-    bleu3 = sacrebleu.corpus_bleu(predictions, [references], weights=[1.0/3.0, 1.0/3.0, 1.0/3.0, 0.0])
-    # BLEU-4 (Standard)
-    bleu4 = sacrebleu.corpus_bleu(predictions, [references])
+    # BLEU-1
+    bleu1 = BLEU(max_ngram_order=1)
+    b1_score = bleu1.corpus_score(predictions, [references]).score
     
-    print(f"BLEU-1: {bleu1.score}")
-    print(f"BLEU-2: {bleu2.score}")
-    print(f"BLEU-3: {bleu3.score}")
-    print(f"BLEU-4: {bleu4.score}")
+    # BLEU-2
+    bleu2 = BLEU(max_ngram_order=2)
+    b2_score = bleu2.corpus_score(predictions, [references]).score
+    
+    # BLEU-3
+    bleu3 = BLEU(max_ngram_order=3)
+    b3_score = bleu3.corpus_score(predictions, [references]).score
+    
+    # BLEU-4 (Standard)
+    bleu4 = BLEU(max_ngram_order=4)
+    b4_score = bleu4.corpus_score(predictions, [references]).score
+    
+    print(f"BLEU-1: {b1_score}")
+    print(f"BLEU-2: {b2_score}")
+    print(f"BLEU-3: {b3_score}")
+    print(f"BLEU-4: {b4_score}")
     
     # Calculate ROUGE Scores
     from rouge_score import rouge_scorer
@@ -178,15 +193,29 @@ def evaluate():
     print(f"ROUGE-2: {avg_rouge2}")
     print(f"ROUGE-L: {avg_rougeL}")
     
+    # Calculate WER
+    wer = jiwer.wer(references, predictions)
+    print(f"WER: {wer}")
+    
+    # Calculate Exact Match Accuracy
+    exact_matches = 0
+    for pred, ref in zip(predictions, references):
+        if pred.strip().lower() == ref.strip().lower():
+            exact_matches += 1
+    accuracy = exact_matches / len(predictions) if len(predictions) > 0 else 0.0
+    print(f"Accuracy: {accuracy:.4f}")
+    
     # Save Results
     with open(args.output_file, "w", encoding="utf-8") as f:
-        f.write(f"BLEU-1: {bleu1.score}\n")
-        f.write(f"BLEU-2: {bleu2.score}\n")
-        f.write(f"BLEU-3: {bleu3.score}\n")
-        f.write(f"BLEU-4: {bleu4.score}\n")
+        f.write(f"BLEU-1: {b1_score}\n")
+        f.write(f"BLEU-2: {b2_score}\n")
+        f.write(f"BLEU-3: {b3_score}\n")
+        f.write(f"BLEU-4: {b4_score}\n")
         f.write(f"ROUGE-1: {avg_rouge1}\n")
         f.write(f"ROUGE-2: {avg_rouge2}\n")
-        f.write(f"ROUGE-L: {avg_rougeL}\n\n")
+        f.write(f"ROUGE-L: {avg_rougeL}\n")
+        f.write(f"WER: {wer}\n")
+        f.write(f"Accuracy: {accuracy:.4f}\n\n")
         for pred, ref in zip(predictions, references):
             f.write(f"Ref:  {ref}\n")
             f.write(f"Pred: {pred}\n")
