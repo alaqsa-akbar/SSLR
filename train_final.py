@@ -53,14 +53,18 @@ def parse_args():
 def train():
     args = parse_args()
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Initialize Accelerator
+    from accelerate import Accelerator
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, log_with="wandb")
+    device = accelerator.device
     
-    # Tensorboard Writer
-    writer = SummaryWriter(log_dir=args.log_dir)
-    
-    # Initialize WandB
-    wandb.init(project="sign-language-translation", name="final-model-training", config=args)
+    # Initialize WandB (only on main process)
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name="sign-language-translation", 
+            config=vars(args),
+            init_kwargs={"wandb": {"name": "final-model-training"}}
+        )
     
     # Paths
     train_csv = os.path.join(args.data_dir, "train.csv")
@@ -72,25 +76,30 @@ def train():
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     except:
-        print(f"Could not load tokenizer from {tokenizer_path}, trying 'google/umt5-base'")
+        if accelerator.is_main_process:
+            print(f"Could not load tokenizer from {tokenizer_path}, trying 'google/umt5-base'")
         tokenizer = AutoTokenizer.from_pretrained("google/umt5-base")
         
     # Load UMT5
-    print("Loading UMT5...")
+    if accelerator.is_main_process:
+        print("Loading UMT5...")
     umt5_weights_path = os.path.join(args.model_dir, "umt5-base.bin")
     
     try:
         if os.path.exists(umt5_weights_path):
-            print(f"Loading UMT5 weights from: {umt5_weights_path}")
+            if accelerator.is_main_process:
+                print(f"Loading UMT5 weights from: {umt5_weights_path}")
             config_path = os.path.join(args.model_dir, "config.json")
             if os.path.exists(config_path):
                 config = UMT5Config.from_pretrained(args.model_dir)
             else:
-                print("Local config not found, using 'google/umt5-base' config")
+                if accelerator.is_main_process:
+                    print("Local config not found, using 'google/umt5-base' config")
                 config = UMT5Config.from_pretrained("google/umt5-base")
             
             if config.d_model != 768:
-                print(f"Warning: Loaded config has d_model={config.d_model}, forcing 768 and vocab 256384")
+                if accelerator.is_main_process:
+                    print(f"Warning: Loaded config has d_model={config.d_model}, forcing 768 and vocab 256384")
                 config.d_model = 768
                 config.vocab_size = 256384
             
@@ -98,11 +107,13 @@ def train():
             state_dict = torch.load(umt5_weights_path, map_location="cpu")
             umt5_model.load_state_dict(state_dict, strict=False)
         else:
-            print(f"Local model file {umt5_weights_path} not found, loading 'google/umt5-base'")
+            if accelerator.is_main_process:
+                print(f"Local model file {umt5_weights_path} not found, loading 'google/umt5-base'")
             umt5_model = UMT5ForConditionalGeneration.from_pretrained("google/umt5-base")
     except Exception as e:
-        print(f"Error loading UMT5: {e}")
-        print("Attempting to create manual UMT5-Base config...")
+        if accelerator.is_main_process:
+            print(f"Error loading UMT5: {e}")
+            print("Attempting to create manual UMT5-Base config...")
         config = UMT5Config(
             vocab_size=256384,
             d_model=768,
@@ -120,11 +131,13 @@ def train():
         umt5_model = UMT5ForConditionalGeneration(config)
         
     # Enable Gradient Checkpointing
-    print("Enabling Gradient Checkpointing for UMT5...")
+    if accelerator.is_main_process:
+        print("Enabling Gradient Checkpointing for UMT5...")
     umt5_model.gradient_checkpointing_enable()
         
     # Datasets
-    print("Loading Datasets...")
+    if accelerator.is_main_process:
+        print("Loading Datasets...")
     train_dataset = SignLanguageDataset(train_csv, pkl_file, tokenizer, max_frames=args.max_frames)
     dev_dataset = SignLanguageDataset(dev_csv, pkl_file, tokenizer, max_frames=args.max_frames)
     
@@ -132,17 +145,20 @@ def train():
     dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
     # Load Pose Encoder
-    print(f"Loading Pose Encoder from {args.pose_config}...")
+    if accelerator.is_main_process:
+        print(f"Loading Pose Encoder from {args.pose_config}...")
     # Ensure RoPE cache is at least as large as the max frames in dataset
     max_pos = max(512, train_dataset.max_frames) # Default 512 if dataset is small, else max_frames
-    print(f"Setting RoPE cache size (max_position_embeddings) to {max_pos}")
+    if accelerator.is_main_process:
+        print(f"Setting RoPE cache size (max_position_embeddings) to {max_pos}")
 
     pose_config = PoseEncoderConfig.from_json_file(args.pose_config)
     pose_config.max_position_embeddings = max_pos # Update dynamic cache size
     
     # Override hidden_dim to match UMT5
     if pose_config.hidden_dim != umt5_model.config.d_model:
-        print(f"Overriding Pose Encoder hidden_dim ({pose_config.hidden_dim}) to match UMT5 ({umt5_model.config.d_model})")
+        if accelerator.is_main_process:
+            print(f"Overriding Pose Encoder hidden_dim ({pose_config.hidden_dim}) to match UMT5 ({umt5_model.config.d_model})")
         pose_config.hidden_dim = umt5_model.config.d_model
         
     pose_encoder = PoseEncoder(pose_config)
@@ -161,11 +177,13 @@ def train():
             checkpoint_path = args.contrastive_model_dir
     
     if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"Loading pretrained Pose Encoder from {checkpoint_path}")
+        if accelerator.is_main_process:
+            print(f"Loading pretrained Pose Encoder from {checkpoint_path}")
         try:
             pose_encoder = PoseEncoder.from_pretrained(checkpoint_path)
         except Exception as e:
-            print(f"Failed to load pretrained pose encoder using standard method: {e}")
+            if accelerator.is_main_process:
+                print(f"Failed to load pretrained pose encoder using standard method: {e}")
             # Manual fallback for safetensors if standard method fails
             try:
                 if os.path.exists(os.path.join(checkpoint_path, "model.safetensors")):
@@ -173,18 +191,21 @@ def train():
                     state_dict = load_file(os.path.join(checkpoint_path, "model.safetensors"))
                     pose_encoder = PoseEncoder(PoseEncoderConfig.from_pretrained(checkpoint_path))
                     pose_encoder.load_state_dict(state_dict)
-                    print("Successfully loaded model.safetensors manually.")
+                    if accelerator.is_main_process:
+                        print("Successfully loaded model.safetensors manually.")
                 else:
                     raise e
             except Exception as e2:
-                print(f"Failed to load pretrained pose encoder: {e2}")
-                print("Training Pose Encoder from scratch.")
+                if accelerator.is_main_process:
+                    print(f"Failed to load pretrained pose encoder: {e2}")
+                    print("Training Pose Encoder from scratch.")
     else:
-        print("Warning: No contrastive checkpoint found. Training Pose Encoder from scratch.")
+        if accelerator.is_main_process:
+            print("Warning: No contrastive checkpoint found. Training Pose Encoder from scratch.")
 
     # Combined Model
     model = SignLanguageModel(pose_encoder, umt5_model)
-    model.to(device)
+    # model.to(device) # Handled by prepare
     
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -195,63 +216,89 @@ def train():
     num_warmup_steps = int(0.1 * num_training_steps) # 10% warmup
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
     
+    # Prepare with Accelerator
+    model, optimizer, train_loader, dev_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, dev_loader, scheduler
+    )
+    
     # Early Stopping variables
     best_val_loss = float('inf')
     
-    print("Starting Training...")
+    if accelerator.is_main_process:
+        print("Starting Training...")
     global_step = 0
+    
     for epoch in range(args.epochs):
         # --- Training ---
         model.train()
         total_loss = 0
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]"):
-            # Move to device
-            pose = batch['pose'].to(device)
-            pose_mask = batch['pose_attention_mask'].to(device)
-            input_ids = batch['input_ids'].to(device)
+        if accelerator.is_main_process:
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
+        else:
+            progress_bar = train_loader
             
-            # Labels for T5 (replace pad with -100)
-            labels = input_ids.clone()
-            labels[labels == tokenizer.pad_token_id] = -100
-            
-            optimizer.zero_grad()
-            
-            # Standard Forward Pass (No AMP)
-            outputs = model(pose, pose_mask, labels=labels)
-            loss = outputs.loss
-            
-            # Normalize loss
-            loss = loss / args.gradient_accumulation_steps
-            
-            # Backward pass without scaler
-            loss.backward()
-            
-            if (global_step + 1) % args.gradient_accumulation_steps == 0:
-                # Gradient Clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        for batch in progress_bar:
+            with accelerator.accumulate(model):
+                # Move to device (Handled by accelerate)
+                # pose = batch['pose'].to(device)
+                # pose_mask = batch['pose_attention_mask'].to(device)
+                # input_ids = batch['input_ids'].to(device)
+                
+                pose = batch['pose']
+                pose_mask = batch['pose_attention_mask']
+                input_ids = batch['input_ids']
+                
+                # Labels for T5 (replace pad with -100)
+                labels = input_ids.clone()
+                labels[labels == tokenizer.pad_token_id] = -100
+                
+                optimizer.zero_grad()
+                
+                # Standard Forward Pass
+                outputs = model(pose, pose_mask, labels=labels)
+                loss = outputs.loss
+                
+                # Backward pass
+                accelerator.backward(loss)
+                
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            
-            total_loss += loss.item() * args.gradient_accumulation_steps
-            writer.add_scalar("Loss/train", loss.item() * args.gradient_accumulation_steps, global_step)
-            wandb.log({"train_loss": loss.item() * args.gradient_accumulation_steps, "epoch": epoch, "global_step": global_step})
-            global_step += 1
+                
+                total_loss += loss.item()
+                if accelerator.is_main_process:
+                    writer.add_scalar("Loss/train", loss.item(), global_step)
+                    accelerator.log({"train_loss": loss.item(), "epoch": epoch, "global_step": global_step}, step=global_step)
+                global_step += 1
             
         avg_train_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
+        if accelerator.is_main_process:
+            print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
         
         # --- Validation ---
         model.eval()
         total_val_loss = 0
-        print("Running Validation...")
+        if accelerator.is_main_process:
+            print("Running Validation...")
+            
+        if accelerator.is_main_process:
+            val_progress_bar = tqdm(dev_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
+        else:
+            val_progress_bar = dev_loader
+            
         with torch.no_grad():
-            for batch in tqdm(dev_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]"):
-                pose = batch['pose'].to(device)
-                pose_mask = batch['pose_attention_mask'].to(device)
-                input_ids = batch['input_ids'].to(device)
+            for batch in val_progress_bar:
+                # pose = batch['pose'].to(device)
+                # pose_mask = batch['pose_attention_mask'].to(device)
+                # input_ids = batch['input_ids'].to(device)
+                
+                pose = batch['pose']
+                pose_mask = batch['pose_attention_mask']
+                input_ids = batch['input_ids']
                 
                 labels = input_ids.clone()
                 labels[labels == tokenizer.pad_token_id] = -100
@@ -259,25 +306,33 @@ def train():
                 outputs = model(pose, pose_mask, labels=labels)
                 loss = outputs.loss
                 
-                total_val_loss += loss.item()
+                # Gather loss across GPUs
+                gathered_loss = accelerator.gather(loss.repeat(args.batch_size))
+                total_val_loss += gathered_loss.mean().item()
         
         avg_val_loss = total_val_loss / len(dev_loader)
-        print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
-        writer.add_scalar("Loss/val", avg_val_loss, epoch)
-        wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
+        if accelerator.is_main_process:
+            print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
+            writer.add_scalar("Loss/val", avg_val_loss, epoch)
+            accelerator.log({"val_loss": avg_val_loss, "epoch": epoch}, step=global_step)
         
         # --- Saving Best Model ---
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            print(f"New best validation loss! Saving model to {args.output_dir}")
-            
-            # Save Best Model
-            model.pose_encoder.save_pretrained(os.path.join(args.output_dir, "pose_encoder"))
-            model.umt5_model.save_pretrained(os.path.join(args.output_dir, "umt5"))
-        else:
-            print(f"No improvement in validation loss.")
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                print(f"New best validation loss! Saving model to {args.output_dir}")
+                
+                # Save Best Model
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.pose_encoder.save_pretrained(os.path.join(args.output_dir, "pose_encoder"))
+                unwrapped_model.umt5_model.save_pretrained(os.path.join(args.output_dir, "umt5"))
+            else:
+                print(f"No improvement in validation loss.")
         
-    writer.close()
+    if accelerator.is_main_process:
+        writer.close()
+    accelerator.end_training()
 
 if __name__ == "__main__":
     train()
