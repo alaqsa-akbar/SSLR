@@ -5,3 +5,4 @@ visualizations/
 output/
 runs/
 evaluation_results/
+wandb/

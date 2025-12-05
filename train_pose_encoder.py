@@ -170,11 +170,21 @@ def train():
             text_counts = torch.clamp(text_mask_expanded.sum(1), min=1e-9)
             text_rep = text_sum / text_counts # (B, H)
             
-            # MSE Loss
-            # The user prefers exact vector matching since these embeddings will be input to the decoder.
-            # MSE forces the model to match both direction and magnitude.
-            mse_loss = nn.MSELoss()
-            loss = mse_loss(pose_rep, text_rep)
+            # Contrastive Loss (InfoNCE)
+            # Normalize embeddings
+            pose_rep = torch.nn.functional.normalize(pose_rep, p=2, dim=1)
+            text_rep = torch.nn.functional.normalize(text_rep, p=2, dim=1)
+            
+            # Cosine similarity matrix
+            logits = torch.matmul(pose_rep, text_rep.T) / temperature # (B, B)
+            
+            # Labels: diagonal elements are positives
+            labels = torch.arange(logits.size(0)).to(device)
+            
+            # Symmetric loss (Pose->Text and Text->Pose)
+            loss_i = nn.CrossEntropyLoss()(logits, labels)
+            loss_t = nn.CrossEntropyLoss()(logits.T, labels)
+            loss = (loss_i + loss_t) / 2
             
             # Normalize loss to account for accumulation
             loss = loss / args.gradient_accumulation_steps
