@@ -6,3 +6,8 @@ output/
 runs/
 evaluation_results/
 wandb/
+logs/
+vocab.json
+__pycache__/
+*/__pycache__/
+*.slurm

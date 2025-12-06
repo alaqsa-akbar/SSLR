@@ -1,8 +1,15 @@
 {
-    "input_dim": 172,
-    "hidden_dim": 768,
-    "num_layers": 6,
-    "num_heads": 8,
-    "dropout": 0.1,
-    "projection_dim": 256
+  "model_type": "pose_encoder",
+  "num_keypoints": 86,
+  "channels": 4,
+  "input_dim": 344, 
+  "hidden_dim": 768,
+  "num_layers": 8,
+  "num_heads": 16,
+  "dropout": 0.2,
+  "projection_dim": 512,
+  "gcn_layers": 4,
+  "gcn_hidden": 256,
+  "num_decoder_layers": 2,
+  "vocab_size": 687
 }

@@ -9,14 +9,14 @@ def download_resources(dataset_repo_id):
     os.makedirs(model_path, exist_ok=True)
     
     # We need specific files for the model to load locally
-    files_to_download = ["config.json", "pytorch_model.bin", "spiece.model", "tokenizer.json", "special_tokens_map.json", "tokenizer_config.json"]
+    # files_to_download = ["config.json", "pytorch_model.bin", "spiece.model", "tokenizer.json", "special_tokens_map.json", "tokenizer_config.json"]
     
-    try:
-        snapshot_download(repo_id="google/umt5-base", local_dir=model_path, local_dir_use_symlinks=False)
-        print(f"UMT5 model downloaded to {model_path}")
-    except Exception as e:
-        print(f"Error downloading UMT5: {e}")
-        print("You might need to install huggingface_hub: pip install huggingface_hub")
+    # try:
+    #     snapshot_download(repo_id="google/umt5-base", local_dir=model_path, local_dir_use_symlinks=False)
+    #     print(f"UMT5 model downloaded to {model_path}")
+    # except Exception as e:
+    #     print(f"Error downloading UMT5: {e}")
+    #     print("You might need to install huggingface_hub: pip install huggingface_hub")
 
     # 2. Download Dataset
     print(f"Downloading Dataset from {dataset_repo_id}...")

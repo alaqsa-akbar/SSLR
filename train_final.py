@@ -1,414 +1,121 @@
 """
-Final Sign Language Translation Model Training
+Final Training: Hybrid CTC/Attention Model for Sign Language Recognition
 
 Architecture:
-- Pose Encoder (pre-trained from contrastive learning)
-- UMT5 Decoder (only decoder, not full encoder-decoder)
-
-This saves ~40% memory by not loading the unused UMT5 encoder.
+1. Pose Encoder (Pre-trained contrastively, frozen or fine-tuned)
+2. CTC Head (For temporal alignment, loss λ)
+3. Tiny Decoder (For sequence generation/grammar, loss 1-λ)
 
 Usage:
     accelerate launch --num_processes 2 train_final.py \
-        --contrastive_model_dir output/pose_encoder_contrastive/best_model/pose_encoder \
-        --output_dir output/sign_language_model_final
+        --contrastive_model_dir output/pose_encoder_cached/best_model/pose_encoder \
+        --output_dir output/sign_language_model_final \
+        --epochs 100 \
+        --batch_size 16 \
+        --lr 1e-4 \
+        --lambda_ctc 0.5
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, UMT5Config, UMT5ForConditionalGeneration
-from transformers import get_linear_schedule_with_warmup
-from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-
-from modules.pose_encoder import PoseEncoder, PoseEncoderConfig
-from modules.dataset import SignLanguageDataset, collate_fn
-
-from tqdm import tqdm
-import os
+from transformers import get_linear_schedule_with_warmup
 import argparse
-from torch.utils.tensorboard import SummaryWriter
+import os
 import json
+from tqdm import tqdm
 
+# Import modules
+from modules.dataset import SignLanguageDataset, GlossTokenizer, collate_fn_hybrid
+from modules.pose_encoder import PoseEncoder, TinyAdvancedDecoder, PoseEncoderConfig
 
-class SignLanguageModel(nn.Module):
+class HybridModel(nn.Module):
     """
-    Sign Language Translation Model
-    
-    Combines a pre-trained Pose Encoder with UMT5 Decoder.
-    The pose encoder produces embeddings that the decoder translates to text.
+    Hybrid SLR Model:
+    - Encoder: Processes video frames (Spatial GCN + Temporal Transformer)
+    - Branch 1 (CTC): Predicts gloss sequence alignment
+    - Branch 2 (Decoder): Autoregressively generates gloss sequence
     """
-    
-    def __init__(self, pose_encoder: PoseEncoder, decoder: nn.Module, decoder_config: UMT5Config):
+    def __init__(self, pose_encoder: PoseEncoder, vocab_size: int, hidden_dim: int = 768, num_decoder_layers: int = 2):
         super().__init__()
-        self.pose_encoder = pose_encoder
-        self.decoder = decoder
-        self.config = decoder_config
+        self.encoder = pose_encoder
+        self.vocab_size = vocab_size
         
-        # LM head for token prediction
-        self.lm_head = nn.Linear(decoder_config.d_model, decoder_config.vocab_size, bias=False)
+        # CTC Head: Projects to Vocab + Blank (Blank is usually index = vocab_size)
+        self.ctc_head = nn.Linear(hidden_dim, vocab_size + 1)
         
-    def forward(
-        self,
-        pose: torch.Tensor,
-        pose_attention_mask: torch.Tensor,
-        labels: torch.Tensor = None,
-        decoder_input_ids: torch.Tensor = None,
-        decoder_attention_mask: torch.Tensor = None,
-    ):
+        # Advanced Tiny Decoder (uses RoPE, RMSNorm from encoder config)
+        dec_config = pose_encoder.config
+        dec_config.num_decoder_layers = num_decoder_layers
+        self.decoder = TinyAdvancedDecoder(vocab_size, dec_config)
+        
+    def forward(self, pose, input_lengths, decoder_input_ids=None):
         """
-        Forward pass for training.
-        
         Args:
-            pose: (B, T, 86, 2) pose keypoints
-            pose_attention_mask: (B, T) mask for pose frames
-            labels: (B, S) target token ids (shifted internally)
-            decoder_input_ids: (B, S) decoder inputs (optional, derived from labels if not provided)
-            decoder_attention_mask: (B, S) decoder attention mask
+            pose: (B, T, 86, 4)
+            input_lengths: (B,) Valid frames for each sample
+            decoder_input_ids: (B, S) Shifted targets for teacher forcing (optional)
         """
-        # Encode pose
-        encoder_hidden_states = self.pose_encoder(pose, attention_mask=pose_attention_mask)
+        # Create mask for encoder (1 for valid frames, 0 for padding)
+        max_len = pose.shape[1]
+        enc_mask = torch.arange(max_len, device=pose.device)[None, :] < input_lengths[:, None]
         
-        # Prepare decoder inputs from labels (shift right)
-        if decoder_input_ids is None and labels is not None:
-            decoder_input_ids = self._shift_right(labels)
+        # 1. Encoder Forward
+        enc_out = self.encoder(pose, attention_mask=enc_mask.float())
         
-        # Decode
-        decoder_outputs = self.decoder(
-            input_ids=decoder_input_ids,
-            attention_mask=decoder_attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=pose_attention_mask,
-        )
+        # 2. CTC Branch
+        ctc_logits = self.ctc_head(enc_out)
         
-        # Project to vocabulary
-        sequence_output = decoder_outputs.last_hidden_state
-        logits = self.lm_head(sequence_output)
-        
-        # Compute loss
-        loss = None
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-        
-        return Seq2SeqLMOutput(
-            loss=loss,
-            logits=logits,
-            past_key_values=decoder_outputs.past_key_values,
-            decoder_hidden_states=decoder_outputs.hidden_states,
-            decoder_attentions=decoder_outputs.attentions,
-        )
-    
-    def _shift_right(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Shift input ids right for decoder input (teacher forcing)."""
-        decoder_start_token_id = self.config.decoder_start_token_id
-        pad_token_id = self.config.pad_token_id
-        
-        if decoder_start_token_id is None:
-            decoder_start_token_id = pad_token_id
-        
-        shifted = input_ids.new_zeros(input_ids.shape)
-        shifted[:, 1:] = input_ids[:, :-1].clone()
-        shifted[:, 0] = decoder_start_token_id
-        
-        # Replace -100 (ignore index) with pad token
-        shifted.masked_fill_(shifted == -100, pad_token_id)
-        
-        return shifted
-    
-    @torch.no_grad()
-    def generate(
-        self,
-        pose: torch.Tensor,
-        pose_attention_mask: torch.Tensor,
-        max_length: int = 128,
-        num_beams: int = 4,
-        early_stopping: bool = True,
-        pad_token_id: int = 0,
-        eos_token_id: int = 1,
-        decoder_start_token_id: int = None,
-    ):
-        """
-        Generate text from pose input using beam search.
-        
-        Args:
-            pose: (B, T, 86, 2) pose keypoints
-            pose_attention_mask: (B, T) mask for pose frames
-            max_length: Maximum generation length
-            num_beams: Number of beams for beam search
+        # 3. Decoder Branch
+        dec_logits = None
+        if decoder_input_ids is not None:
+            # Encoder mask is passed to decoder to ignore padding keys in cross-attention
+            dec_logits = self.decoder(decoder_input_ids, enc_out, enc_mask=enc_mask.float())
             
-        Returns:
-            Generated token ids: (B, S)
-        """
-        batch_size = pose.size(0)
-        device = pose.device
-        
-        if decoder_start_token_id is None:
-            decoder_start_token_id = self.config.decoder_start_token_id or pad_token_id
-        
-        # Encode pose once
-        encoder_hidden_states = self.pose_encoder(pose, attention_mask=pose_attention_mask)
-        
-        # Initialize decoder input
-        decoder_input_ids = torch.full(
-            (batch_size, 1),
-            decoder_start_token_id,
-            dtype=torch.long,
-            device=device
-        )
-        
-        # Simple greedy decoding (for beam search, use HuggingFace's generate)
-        for _ in range(max_length - 1):
-            decoder_outputs = self.decoder(
-                input_ids=decoder_input_ids,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=pose_attention_mask,
-            )
-            
-            logits = self.lm_head(decoder_outputs.last_hidden_state[:, -1, :])
-            next_token = logits.argmax(dim=-1, keepdim=True)
-            
-            decoder_input_ids = torch.cat([decoder_input_ids, next_token], dim=1)
-            
-            # Check if all sequences have generated EOS
-            if (next_token == eos_token_id).all():
-                break
-        
-        return decoder_input_ids
-    
-    def save_pretrained(self, save_directory: str):
-        """Save model components separately."""
-        os.makedirs(save_directory, exist_ok=True)
-        
-        # Save pose encoder
-        pose_encoder_path = os.path.join(save_directory, "pose_encoder")
-        self.pose_encoder.save_pretrained(pose_encoder_path)
-        
-        # Save decoder
-        decoder_path = os.path.join(save_directory, "decoder")
-        os.makedirs(decoder_path, exist_ok=True)
-        torch.save(self.decoder.state_dict(), os.path.join(decoder_path, "pytorch_model.bin"))
-        self.config.save_pretrained(decoder_path)
-        
-        # Save LM head
-        torch.save(self.lm_head.state_dict(), os.path.join(save_directory, "lm_head.pt"))
-        
-        # Save full config
-        config_dict = {
-            "pose_encoder_path": "pose_encoder",
-            "decoder_path": "decoder",
-            "model_type": "sign_language_model"
-        }
-        with open(os.path.join(save_directory, "config.json"), "w") as f:
-            json.dump(config_dict, f, indent=2)
-    
-    @classmethod
-    def from_pretrained(cls, load_directory: str, device: torch.device = None):
-        """Load model from saved directory."""
-        # Load pose encoder
-        pose_encoder_path = os.path.join(load_directory, "pose_encoder")
-        pose_encoder = PoseEncoder.from_pretrained(pose_encoder_path)
-        
-        # Load decoder config and weights
-        decoder_path = os.path.join(load_directory, "decoder")
-        decoder_config = UMT5Config.from_pretrained(decoder_path)
-        
-        # Create decoder from config
-        full_model = UMT5ForConditionalGeneration(decoder_config)
-        decoder = full_model.decoder
-        
-        # Load decoder weights
-        decoder_weights = torch.load(
-            os.path.join(decoder_path, "pytorch_model.bin"),
-            map_location=device or "cpu"
-        )
-        decoder.load_state_dict(decoder_weights)
-        
-        # Create model
-        model = cls(pose_encoder, decoder, decoder_config)
-        
-        # Load LM head
-        lm_head_path = os.path.join(load_directory, "lm_head.pt")
-        if os.path.exists(lm_head_path):
-            model.lm_head.load_state_dict(torch.load(lm_head_path, map_location=device or "cpu"))
-        
-        return model
-
-
-def load_umt5_decoder(model_dir: str, accelerator: Accelerator):
-    """
-    Load only the decoder from UMT5.
-    
-    Returns:
-        decoder: The UMT5 decoder module
-        config: The UMT5 config
-    """
-    umt5_weights_path = os.path.join(model_dir, "umt5-base.bin")
-    
-    try:
-        if os.path.exists(umt5_weights_path):
-            if accelerator.is_main_process:
-                print(f"Loading UMT5 from: {umt5_weights_path}")
-            
-            config_path = os.path.join(model_dir, "config.json")
-            if os.path.exists(config_path):
-                config = UMT5Config.from_pretrained(model_dir)
-            else:
-                config = UMT5Config.from_pretrained("google/umt5-base")
-            
-            if config.d_model != 768:
-                config.d_model = 768
-                config.vocab_size = 256384
-            
-            # Load full model temporarily to extract decoder
-            full_model = UMT5ForConditionalGeneration(config)
-            state_dict = torch.load(umt5_weights_path, map_location="cpu")
-            full_model.load_state_dict(state_dict, strict=False)
-            
-        else:
-            if accelerator.is_main_process:
-                print("Loading UMT5 from HuggingFace...")
-            full_model = UMT5ForConditionalGeneration.from_pretrained("google/umt5-base")
-            config = full_model.config
-            
-    except Exception as e:
-        if accelerator.is_main_process:
-            print(f"Error loading UMT5: {e}, creating from config...")
-        config = UMT5Config(
-            vocab_size=256384, d_model=768, d_kv=64, d_ff=2048,
-            num_layers=12, num_decoder_layers=12, num_heads=12,
-            relative_attention_num_buckets=32, dropout_rate=0.1,
-            layer_norm_epsilon=1e-6, feed_forward_proj="gated-gelu",
-            is_encoder_decoder=True
-        )
-        full_model = UMT5ForConditionalGeneration(config)
-    
-    # Extract only decoder
-    decoder = full_model.decoder
-    
-    # Delete the full model to free memory
-    del full_model.encoder
-    del full_model
-    torch.cuda.empty_cache()
-    
-    if accelerator.is_main_process:
-        print(f"Loaded UMT5 decoder with {sum(p.numel() for p in decoder.parameters())/1e6:.1f}M parameters")
-    
-    return decoder, config
-
-
-def load_pose_encoder(contrastive_model_dir: str, pose_config_path: str, hidden_dim: int, accelerator: Accelerator):
-    """
-    Load pose encoder from contrastive pre-training or initialize from scratch.
-    
-    Args:
-        contrastive_model_dir: Path to contrastive model checkpoint
-        pose_config_path: Path to pose encoder config JSON
-        hidden_dim: Hidden dimension (must match UMT5)
-        
-    Returns:
-        PoseEncoder model
-    """
-    # First, try to load from contrastive checkpoint
-    if contrastive_model_dir and os.path.exists(contrastive_model_dir):
-        # Check various possible paths
-        possible_paths = [
-            contrastive_model_dir,  # Direct path
-            os.path.join(contrastive_model_dir, "pose_encoder"),  # Subdirectory
-            os.path.join(contrastive_model_dir, "best_model", "pose_encoder"),  # Best model
-            os.path.join(contrastive_model_dir, "final_model", "pose_encoder"),  # Final model
-        ]
-        
-        for path in possible_paths:
-            config_file = os.path.join(path, "config.json")
-            if os.path.exists(config_file):
-                if accelerator.is_main_process:
-                    print(f"Loading pre-trained Pose Encoder from: {path}")
-                try:
-                    pose_encoder = PoseEncoder.from_pretrained(path)
-                    
-                    # Verify hidden_dim matches
-                    if pose_encoder.config.hidden_dim != hidden_dim:
-                        if accelerator.is_main_process:
-                            print(f"Warning: Pose encoder hidden_dim ({pose_encoder.config.hidden_dim}) "
-                                  f"doesn't match UMT5 ({hidden_dim}). This may cause issues.")
-                    
-                    if accelerator.is_main_process:
-                        print(f"Successfully loaded pose encoder with {sum(p.numel() for p in pose_encoder.parameters())/1e6:.1f}M parameters")
-                    return pose_encoder
-                    
-                except Exception as e:
-                    if accelerator.is_main_process:
-                        print(f"Failed to load from {path}: {e}")
-                    continue
-        
-        if accelerator.is_main_process:
-            print(f"Could not find valid checkpoint in {contrastive_model_dir}")
-    
-    # Fallback: Initialize from config
-    if accelerator.is_main_process:
-        print(f"Initializing Pose Encoder from config: {pose_config_path}")
-    
-    pose_config = PoseEncoderConfig.from_json_file(pose_config_path)
-    pose_config.hidden_dim = hidden_dim  # Ensure it matches UMT5
-    
-    pose_encoder = PoseEncoder(pose_config)
-    
-    if accelerator.is_main_process:
-        print(f"Initialized fresh pose encoder with {sum(p.numel() for p in pose_encoder.parameters())/1e6:.1f}M parameters")
-        print("WARNING: Training without contrastive pre-training may result in worse performance!")
-    
-    return pose_encoder
-
+        return ctc_logits, dec_logits
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Sign Language Translation Model")
+    parser = argparse.ArgumentParser(description="Train Hybrid SLR Model")
     
-    # Data
-    parser.add_argument("--data_dir", type=str, default="data", help="Path to data directory")
-    parser.add_argument("--model_dir", type=str, default="models/umt5",
-                        help="Path to UMT5 model directory")
-    parser.add_argument("--contrastive_model_dir", type=str, 
-                        default="output/pose_encoder_contrastive/best_model/pose_encoder",
-                        help="Path to pre-trained pose encoder from contrastive learning")
+    # Data & Paths
+    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--contrastive_model_dir", type=str, required=True, 
+                        help="Path to pre-trained pose encoder from Stage 1")
+    parser.add_argument("--vocab_file", type=str, default="vocab.json", 
+                        help="Path to vocabulary JSON (from build_vocab.py)")
+    parser.add_argument("--pose_config", type=str, default="configs/pose_encoder_config.json",
+                        help="Path to pose encoder config JSON")
+    parser.add_argument("--fresh_start", action="store_true", 
+                        help="If set, do not load weights from pre-trained encoder.")
     
     # Output
-    parser.add_argument("--output_dir", type=str, default="output/sign_language_model_final",
-                        help="Path to save checkpoints")
-    parser.add_argument("--log_dir", type=str, default="runs/sign_language_model_final",
-                        help="Path to tensorboard logs")
+    parser.add_argument("--output_dir", type=str, default="output/sign_language_model_final")
+    parser.add_argument("--log_dir", type=str, default="runs/sign_language_model_final")
+    parser.add_argument("--wandb_project", type=str, default="slr")
     
-    # Training
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size per GPU")
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
-                        help="Gradient accumulation steps")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    # Training Hyperparams
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
     
-    # Model
-    parser.add_argument("--max_frames", type=int, default=None, help="Max frames for poses")
-    parser.add_argument("--pose_config", type=str, default="configs/pose_encoder_config.json",
-                        help="Path to pose encoder config")
-    
-    # Early stopping
-    parser.add_argument("--patience", type=int, default=10,
-                        help="Early stopping patience (epochs without improvement)")
+    # Hybrid Loss Weights
+    parser.add_argument("--lambda_ctc", type=float, default=0.5, 
+                        help="Weight for CTC loss (0.0 to 1.0). Decoder weight is 1 - lambda.")
     
     # Checkpointing
-    parser.add_argument("--save_every", type=int, default=5, help="Save checkpoint every N epochs")
-    parser.add_argument("--eval_every", type=int, default=1, help="Evaluate every N epochs")
-    
-    # Generation (for validation)
-    parser.add_argument("--num_beams", type=int, default=4, help="Beam size for generation")
-    parser.add_argument("--max_gen_length", type=int, default=128, help="Max generation length")
-    
-    return parser.parse_args()
+    parser.add_argument("--save_every", type=int, default=5)
+    parser.add_argument("--eval_every", type=int, default=1)
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
 
+    return parser.parse_args()
 
 def train():
     args = parse_args()
@@ -416,160 +123,127 @@ def train():
     # Initialize Accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        log_with=["tensorboard"],
+        log_with=["wandb"],
         project_dir=args.log_dir
     )
     
     set_seed(args.seed)
     device = accelerator.device
     
-    # Initialize logging
+    # Logging Setup
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(args.log_dir, exist_ok=True)
-        
         accelerator.init_trackers(
-            project_name="sign-language-translation",
-            config=vars(args)
+            project_name=args.wandb_project,
+            config=vars(args),
+            init_kwargs={"wandb": {"name": f"hybrid-{args.batch_size}bs"}}
         )
-        
+        # Save args
         with open(os.path.join(args.output_dir, "training_args.json"), "w") as f:
             json.dump(vars(args), f, indent=2)
+
+    # 1. Load Vocab & Tokenizer
+    if not os.path.exists(args.vocab_file):
+        raise FileNotFoundError(f"Vocab file {args.vocab_file} not found. Run build_vocab.py first.")
+    tokenizer = GlossTokenizer(args.vocab_file)
     
-    # Paths
-    train_csv = os.path.join(args.data_dir, "train.csv")
-    dev_csv = os.path.join(args.data_dir, "dev.csv")
-    pkl_file = os.path.join(args.data_dir, "data.pkl")
+    # 2. Load Datasets
+    if accelerator.is_main_process: print("Loading datasets...")
+    train_dataset = SignLanguageDataset(f"{args.data_dir}/train.csv", f"{args.data_dir}/data.pkl", tokenizer, mode='hybrid')
+    dev_dataset = SignLanguageDataset(f"{args.data_dir}/dev.csv", f"{args.data_dir}/data.pkl", tokenizer, mode='hybrid')
     
-    # Load tokenizer
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn_hybrid, num_workers=4, pin_memory=True)
+    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, collate_fn=collate_fn_hybrid, num_workers=4)
+    
+    # 3. Model Initialization
     if accelerator.is_main_process:
-        print("Loading tokenizer...")
-    tokenizer_path = os.path.join(args.model_dir, "tokenizer.json")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    except:
-        tokenizer = AutoTokenizer.from_pretrained("google/umt5-base")
+        if args.fresh_start:
+            print("Initializing random Pose Encoder (fresh start).")
+        else:
+            print(f"Loading Pre-trained Pose Encoder from {args.contrastive_model_dir}...")
     
-    # Load UMT5 decoder only
-    if accelerator.is_main_process:
-        print("Loading UMT5 decoder...")
-    decoder, umt5_config = load_umt5_decoder(args.model_dir, accelerator)
+    config = PoseEncoderConfig.from_json_file(args.pose_config)
+    if args.fresh_start:
+        pose_encoder = PoseEncoder(config)
+    else:
+        try:
+            pose_encoder = PoseEncoder.from_pretrained(args.contrastive_model_dir)
+        except Exception as e:
+            if accelerator.is_main_process:
+                print(f"Warning: Could not load weights ({e}). initializing random encoder.")
+        pose_encoder = PoseEncoder(config)
+
+    model = HybridModel(pose_encoder, tokenizer.vocab_size, hidden_dim=config.hidden_dim, num_decoder_layers=config.num_decoder_layers)
     
-    # Load pose encoder
-    if accelerator.is_main_process:
-        print("Loading Pose Encoder...")
-    pose_encoder = load_pose_encoder(
-        args.contrastive_model_dir,
-        args.pose_config,
-        umt5_config.d_model,
-        accelerator
+    # 4. Losses
+    # CTC: Blank token is usually the last index (vocab_size)
+    ctc_criterion = nn.CTCLoss(blank=tokenizer.vocab_size, zero_infinity=True)
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    
+    # 5. Optimizer & Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    num_training_steps = len(train_loader) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=int(args.warmup_ratio * num_training_steps), 
+        num_training_steps=num_training_steps
     )
     
-    # Create combined model
-    model = SignLanguageModel(pose_encoder, decoder, umt5_config)
-    
-    # Enable gradient checkpointing for memory efficiency
-    if hasattr(decoder, 'gradient_checkpointing_enable'):
-        decoder.gradient_checkpointing_enable()
-        if accelerator.is_main_process:
-            print("Enabled gradient checkpointing for decoder")
-    
-    # Load datasets
-    if accelerator.is_main_process:
-        print("Loading datasets...")
-    train_dataset = SignLanguageDataset(train_csv, pkl_file, tokenizer, max_frames=args.max_frames)
-    dev_dataset = SignLanguageDataset(dev_csv, pkl_file, tokenizer, max_frames=args.max_frames)
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True
-    )
-    dev_loader = DataLoader(
-        dev_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay
-    )
-    
-    # Scheduler
-    num_training_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
-    num_warmup_steps = int(args.warmup_ratio * num_training_steps)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
-    
-    # Prepare with accelerator
     model, optimizer, train_loader, dev_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, dev_loader, scheduler
     )
     
-    # Print training info
-    if accelerator.is_main_process:
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"\n{'='*60}")
-        print(f"Training Configuration:")
-        print(f"  - Total parameters: {total_params/1e6:.1f}M")
-        print(f"  - Trainable parameters: {trainable_params/1e6:.1f}M")
-        print(f"  - Batch size per GPU: {args.batch_size}")
-        print(f"  - Number of GPUs: {accelerator.num_processes}")
-        print(f"  - Gradient accumulation: {args.gradient_accumulation_steps}")
-        print(f"  - Effective batch size: {args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
-        print(f"  - Training steps: {num_training_steps}")
-        print(f"  - Warmup steps: {num_warmup_steps}")
-        print(f"{'='*60}\n")
-    
-    # Training loop
+    # ============================================
+    # Training Loop
+    # ============================================
     global_step = 0
     best_val_loss = float('inf')
     patience_counter = 0
     
     for epoch in range(args.epochs):
-        # ============ Training ============
         model.train()
         total_loss = 0
-        num_batches = 0
+        total_ctc = 0
+        total_ce = 0
         
         if accelerator.is_main_process:
-            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         else:
             progress_bar = train_loader
-        
+            
         for batch in progress_bar:
             with accelerator.accumulate(model):
+                # Prepare Inputs
                 pose = batch['pose']
-                pose_mask = batch['pose_attention_mask']
-                input_ids = batch['input_ids']
-                attention_mask = batch['attention_mask']
+                input_lens = batch['input_lengths']
+                labels = batch['labels'] # (B, S) padded with -100
                 
-                # Prepare labels (replace pad with -100)
-                labels = input_ids.clone()
-                labels[labels == tokenizer.pad_token_id] = -100
+                # Decoder Inputs: Replace -100 with PAD, Shift Right (Prepend SOS)
+                dec_input = labels.clone()
+                dec_input[dec_input == -100] = tokenizer.pad_token_id
+                sos_col = torch.full((dec_input.shape[0], 1), tokenizer.sos_token_id, device=device)
+                dec_input = torch.cat([sos_col, dec_input[:, :-1]], dim=1)
                 
-                # Forward pass
-                outputs = model(
-                    pose=pose,
-                    pose_attention_mask=pose_mask,
-                    labels=labels,
-                    decoder_attention_mask=attention_mask
-                )
+                # Forward
+                ctc_logits, dec_logits = model(pose, input_lens, dec_input)
                 
-                loss = outputs.loss
+                # --- Loss 1: CTC ---
+                # LogSoftmax: (T, B, V)
+                ctc_log_probs = ctc_logits.permute(1, 0, 2).log_softmax(2)
+                # Targets: Flattened, remove padding
+                ctc_targets = labels[labels != -100]
+                loss_ctc = ctc_criterion(ctc_log_probs, ctc_targets, input_lens, batch['target_lengths'])
                 
-                # Backward pass
+                # --- Loss 2: Cross Entropy ---
+                # Flatten: (B*S, V)
+                loss_ce = ce_criterion(dec_logits.reshape(-1, tokenizer.vocab_size), labels.reshape(-1))
+                
+                # Weighted Sum
+                loss = (args.lambda_ctc * loss_ctc) + ((1 - args.lambda_ctc) * loss_ce)
+                
                 accelerator.backward(loss)
-                
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 
@@ -577,124 +251,111 @@ def train():
                 scheduler.step()
                 optimizer.zero_grad()
                 
+                # Metrics
                 total_loss += loss.item()
-                num_batches += 1
+                total_ctc += loss_ctc.item()
+                total_ce += loss_ce.item()
+                global_step += 1
                 
                 if accelerator.is_main_process:
                     accelerator.log({
                         "train/loss": loss.item(),
-                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/ctc_loss": loss_ctc.item(),
+                        "train/ce_loss": loss_ce.item(),
+                        "train/lr": scheduler.get_last_lr()[0]
                     }, step=global_step)
                     
-                    progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
-                
-                global_step += 1
-        
-        avg_train_loss = total_loss / num_batches
-        
-        if accelerator.is_main_process:
-            print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f}")
-        
-        # ============ Validation ============
+                    if global_step % 10 == 0:
+                        progress_bar.set_postfix({'loss': f"{loss.item():.4f}", 'ctc': f"{loss_ctc.item():.2f}"})
+
+        # ============================================
+        # Validation
+        # ============================================
         if (epoch + 1) % args.eval_every == 0:
             model.eval()
-            total_val_loss = 0
-            num_val_batches = 0
+            val_loss = 0
             
-            if accelerator.is_main_process:
-                val_progress_bar = tqdm(dev_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
-            else:
-                val_progress_bar = dev_loader
-            
+            # For validation, we compute Loss (teacher forcing) 
+            # AND perform one Greedy Decode just to see progress
             with torch.no_grad():
-                for batch in val_progress_bar:
+                if accelerator.is_main_process:
+                    val_pbar = tqdm(dev_loader, desc="Validating")
+                else:
+                    val_pbar = dev_loader
+                    
+                for i, batch in enumerate(val_pbar):
                     pose = batch['pose']
-                    pose_mask = batch['pose_attention_mask']
-                    input_ids = batch['input_ids']
-                    attention_mask = batch['attention_mask']
+                    input_lens = batch['input_lengths']
+                    labels = batch['labels']
                     
-                    labels = input_ids.clone()
-                    labels[labels == tokenizer.pad_token_id] = -100
+                    # Prepare Decoder Input
+                    dec_input = labels.clone()
+                    dec_input[dec_input == -100] = tokenizer.pad_token_id
+                    sos_col = torch.full((dec_input.shape[0], 1), tokenizer.sos_token_id, device=device)
+                    dec_input = torch.cat([sos_col, dec_input[:, :-1]], dim=1)
                     
-                    outputs = model(
-                        pose=pose,
-                        pose_attention_mask=pose_mask,
-                        labels=labels,
-                        decoder_attention_mask=attention_mask
-                    )
+                    # Forward
+                    ctc_logits, dec_logits = model(pose, input_lens, dec_input)
                     
-                    loss = outputs.loss
+                    # Calculate Validation Loss (Same metric as train)
+                    ctc_log_probs = ctc_logits.permute(1, 0, 2).log_softmax(2)
+                    ctc_targets = labels[labels != -100]
+                    loss_ctc = ctc_criterion(ctc_log_probs, ctc_targets, input_lens, batch['target_lengths'])
+                    loss_ce = ce_criterion(dec_logits.reshape(-1, tokenizer.vocab_size), labels.reshape(-1))
                     
-                    # Gather loss
-                    gathered_loss = accelerator.gather(loss.unsqueeze(0))
-                    total_val_loss += gathered_loss.mean().item()
-                    num_val_batches += 1
-            
-            avg_val_loss = total_val_loss / num_val_batches
+                    loss = (args.lambda_ctc * loss_ctc) + ((1 - args.lambda_ctc) * loss_ce)
+                    val_loss += loss.item()
+                    
+                    # Qualitative Check (Greedy CTC) - Only on first batch of first GPU
+                    if i == 0 and accelerator.is_main_process:
+                        pred_ids = torch.argmax(ctc_logits[0], dim=-1)
+                        # Decode
+                        tokens = []
+                        prev = -1
+                        for t in pred_ids[:input_lens[0]]:
+                            t = t.item()
+                            if t != prev and t != tokenizer.vocab_size:
+                                tokens.append(t)
+                            prev = t
+                        
+                        pred_str = tokenizer.decode(tokens)
+                        ref_str = batch['raw_text'][0]
+                        print(f"\n[Val Sample] Ref: {ref_str} || Pred: {pred_str}")
+
+            avg_val_loss = val_loss / len(dev_loader)
+            accelerator.wait_for_everyone()
             
             if accelerator.is_main_process:
-                print(f"Epoch {epoch+1} - Val Loss: {avg_val_loss:.4f}")
+                # print train and val losses
+                print(f"Epoch {epoch+1} Train Loss: {total_loss/len(train_loader):.4f} (CTC: {total_ctc/len(train_loader):.4f}, CE: {total_ce/len(train_loader):.4f})")
+                print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
+                accelerator.log({"val/loss": avg_val_loss}, step=global_step)
                 
-                accelerator.log({
-                    "val/loss": avg_val_loss,
-                    "epoch": epoch + 1
-                }, step=global_step)
-                
-                # Check for improvement
+                # Checkpointing & Early Stopping
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     patience_counter = 0
                     
-                    # Save best model
                     save_path = os.path.join(args.output_dir, "best_model")
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    unwrapped_model.save_pretrained(save_path)
-                    tokenizer.save_pretrained(save_path)
-                    
-                    print(f"  → Saved best model (val_loss: {avg_val_loss:.4f})")
+                    accelerator.unwrap_model(model).encoder.save_pretrained(os.path.join(save_path, "pose_encoder"))
+                    torch.save(accelerator.unwrap_model(model).state_dict(), os.path.join(save_path, "pytorch_model.bin"))
+                    print(f"--> Saved Best Model (Loss: {best_val_loss:.4f})")
                 else:
                     patience_counter += 1
-                    print(f"  → No improvement. Patience: {patience_counter}/{args.patience}")
-                    
+                    print(f"No improvement. Patience: {patience_counter}/{args.patience}")
                     if patience_counter >= args.patience:
-                        print(f"\nEarly stopping triggered after {epoch+1} epochs!")
+                        print("Early stopping triggered!")
                         break
-        
-        # ============ Periodic Checkpoint ============
+
+        # Periodic Save
         if (epoch + 1) % args.save_every == 0:
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
-                checkpoint_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
-                unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.save_pretrained(checkpoint_path)
-                
-                # Save training state
-                torch.save({
-                    'epoch': epoch + 1,
-                    'global_step': global_step,
-                    'best_val_loss': best_val_loss,
-                    'patience_counter': patience_counter,
-                    'optimizer_state': optimizer.state_dict(),
-                    'scheduler_state': scheduler.state_dict(),
-                }, os.path.join(checkpoint_path, "training_state.pt"))
-                
-                print(f"  → Saved checkpoint at epoch {epoch+1}")
-    
-    # ============ Final Save ============
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        print(f"\nTraining complete!")
-        print(f"Best validation loss: {best_val_loss:.4f}")
-        
-        # Save final model
-        final_path = os.path.join(args.output_dir, "final_model")
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(final_path)
-        tokenizer.save_pretrained(final_path)
-        
-        accelerator.end_training()
-        print("Done!")
+                save_path = os.path.join(args.output_dir, f"checkpoint-ep{epoch+1}")
+                os.makedirs(save_path, exist_ok=True)
+                torch.save(accelerator.unwrap_model(model).state_dict(), os.path.join(save_path, "model.pt"))
 
+    accelerator.end_training()
 
 if __name__ == "__main__":
     train()
