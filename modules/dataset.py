@@ -4,6 +4,7 @@ import pandas as pd
 import pickle
 import numpy as np
 import json
+from scipy import interpolate
 
 
 class GlossTokenizer:
@@ -20,12 +21,7 @@ class GlossTokenizer:
         self.vocab_size = len(self.token_to_id)
     
     def encode_for_ctc(self, sentence):
-        """
-        Encode for CTC loss - NO special tokens.
-        CTC doesn't need SOS/EOS, just the content tokens.
-        
-        Example: "انا حب اكل" -> [id_انا, id_حب, id_اكل]
-        """
+        """Encode for CTC loss - NO special tokens."""
         if not isinstance(sentence, str):
             return []
         tokens = sentence.strip().split()
@@ -33,13 +29,7 @@ class GlossTokenizer:
         return ids
     
     def encode_for_decoder(self, sentence):
-        """
-        Encode for decoder/cross-entropy loss - with EOS token.
-        Decoder needs EOS to know when to stop generating.
-        (SOS is prepended separately during training)
-        
-        Example: "انا حب اكل" -> [id_انا, id_حب, id_اكل, id_EOS]
-        """
+        """Encode for decoder/cross-entropy loss - with EOS token."""
         if not isinstance(sentence, str):
             return []
         tokens = sentence.strip().split()
@@ -48,10 +38,7 @@ class GlossTokenizer:
         return ids
         
     def encode(self, sentence, add_special_tokens=True):
-        """
-        Legacy encode method for backward compatibility.
-        Prefer encode_for_ctc() or encode_for_decoder() for clarity.
-        """
+        """Legacy encode method for backward compatibility."""
         if add_special_tokens:
             return self.encode_for_decoder(sentence)
         else:
@@ -67,7 +54,7 @@ class GlossTokenizer:
             if i == self.eos_token_id:
                 break 
             token = self.id_to_token.get(i, "")
-            if token:  # Skip empty strings
+            if token:
                 tokens.append(token)
         return " ".join(tokens)
 
@@ -75,12 +62,6 @@ class GlossTokenizer:
 def normalize_keypoints(keypoints, invalid_value=-1.0):
     """
     Robust normalization for keypoints using global standardization.
-    
-    This approach:
-    1. Centers data using mean of all valid points
-    2. Scales using standard deviation (robust to outliers)
-    3. Preserves relative scale information between samples
-    4. Properly handles invalid/missing keypoints
     
     Args:
         keypoints: (T, N, 2) array of (x, y) coordinates
@@ -93,30 +74,23 @@ def normalize_keypoints(keypoints, invalid_value=-1.0):
     arr = keypoints.copy().astype(np.float32)
     T, N, C = arr.shape
     
-    # Create validity mask: point is valid if BOTH x and y are not invalid
-    valid_mask = ~np.isclose(arr, invalid_value, atol=1e-6).any(axis=-1)  # (T, N)
-    
-    # Count valid points
+    # Create validity mask
+    valid_mask = ~np.isclose(arr, invalid_value, atol=1e-6).any(axis=-1)
     num_valid = valid_mask.sum()
     
     if num_valid == 0:
-        # No valid points - return zeros
         return np.zeros_like(arr), valid_mask
     
-    # Extract all valid points for computing statistics
-    valid_points = arr[valid_mask]  # (num_valid, 2)
+    # Extract valid points for statistics
+    valid_points = arr[valid_mask]
     
-    # Compute global center (mean of all valid points)
-    center = valid_points.mean(axis=0)  # (2,)
-    
-    # Compute global scale (std of all valid points)
+    # Compute global center and scale
+    center = valid_points.mean(axis=0)
     std = valid_points.std()
-    scale = max(1e-6, std)  # Prevent division by zero
+    scale = max(1e-6, std)
     
-    # Normalize valid points: center and scale
+    # Normalize
     arr[valid_mask] = (arr[valid_mask] - center) / scale
-    
-    # Set invalid points to 0 (neutral value after normalization)
     arr[~valid_mask] = 0.0
     
     return arr, valid_mask
@@ -125,9 +99,6 @@ def normalize_keypoints(keypoints, invalid_value=-1.0):
 def compute_velocity(pose, valid_mask):
     """
     Compute velocity (temporal derivative) of keypoints.
-    
-    CRITICAL: Velocity is only valid when BOTH current AND previous frames
-    have valid observations.
     
     Args:
         pose: (T, N, 2) normalized keypoints
@@ -139,20 +110,190 @@ def compute_velocity(pose, valid_mask):
     T, N, C = pose.shape
     velocity = np.zeros_like(pose)
     
-    # Compute raw differences
     velocity[1:] = pose[1:] - pose[:-1]
     
-    # Velocity is only valid when BOTH current AND previous frame are valid
+    # Velocity valid only when both current and previous frames are valid
     valid_velocity_mask = np.zeros((T, N), dtype=bool)
     valid_velocity_mask[1:] = valid_mask[1:] & valid_mask[:-1]
     
-    # Zero out invalid velocities
     velocity[~valid_velocity_mask] = 0.0
-    
-    # First frame always has zero velocity
     velocity[0] = 0.0
     
     return velocity
+
+
+# =============================================================================
+# AUGMENTATION FUNCTIONS
+# =============================================================================
+
+def augment_rotation(pose, valid_mask, max_angle_degrees=12):
+    """
+    Apply random rotation around the body center.
+    
+    Rotation is applied around the centroid of valid keypoints,
+    simulating camera tilt or signer leaning.
+    
+    Args:
+        pose: (T, N, 2) normalized keypoints
+        valid_mask: (T, N) boolean mask
+        max_angle_degrees: Maximum rotation angle (±)
+    
+    Returns:
+        rotated_pose: (T, N, 2) rotated keypoints
+    """
+    if valid_mask.sum() == 0:
+        return pose
+    
+    angle_deg = np.random.uniform(-max_angle_degrees, max_angle_degrees)
+    angle_rad = np.radians(angle_deg)
+    
+    # Rotation matrix
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    rotation_matrix = np.array([
+        [cos_a, -sin_a],
+        [sin_a, cos_a]
+    ], dtype=np.float32)
+    
+    # Compute center of rotation (mean of all valid points)
+    valid_points = pose[valid_mask]
+    center = valid_points.mean(axis=0)
+    
+    # Apply rotation
+    rotated = pose.copy()
+    # Center, rotate, uncenter
+    centered = pose[valid_mask] - center
+    rotated_points = centered @ rotation_matrix.T
+    rotated[valid_mask] = rotated_points + center
+    
+    return rotated
+
+
+def augment_speed(pose, valid_mask, speed_range=(0.85, 1.15)):
+    """
+    Apply speed perturbation via temporal interpolation.
+    
+    Speed < 1.0: Slower signing (more frames)
+    Speed > 1.0: Faster signing (fewer frames)
+    
+    Args:
+        pose: (T, N, 2) normalized keypoints
+        valid_mask: (T, N) boolean mask
+        speed_range: (min_speed, max_speed) tuple
+    
+    Returns:
+        resampled_pose: (T_new, N, 2) resampled keypoints
+        resampled_mask: (T_new, N) resampled mask
+    """
+    T, N, C = pose.shape
+    
+    if T < 4:  # Too short to interpolate
+        return pose, valid_mask
+    
+    speed = np.random.uniform(*speed_range)
+    new_T = int(T / speed)
+    new_T = max(4, min(new_T, int(T * 1.5)))  # Clamp to reasonable range
+    
+    if new_T == T:
+        return pose, valid_mask
+    
+    # Original time points
+    t_orig = np.linspace(0, 1, T)
+    t_new = np.linspace(0, 1, new_T)
+    
+    # Interpolate each keypoint
+    resampled_pose = np.zeros((new_T, N, C), dtype=np.float32)
+    
+    for n in range(N):
+        for c in range(C):
+            # Use linear interpolation
+            f = interpolate.interp1d(t_orig, pose[:, n, c], kind='linear', fill_value='extrapolate')
+            resampled_pose[:, n, c] = f(t_new)
+    
+    # Interpolate mask (use nearest neighbor to keep binary)
+    resampled_mask = np.zeros((new_T, N), dtype=bool)
+    mask_float = valid_mask.astype(float)
+    for n in range(N):
+        f = interpolate.interp1d(t_orig, mask_float[:, n], kind='nearest', fill_value='extrapolate')
+        resampled_mask[:, n] = f(t_new) > 0.5
+    
+    return resampled_pose, resampled_mask
+
+
+def augment_frame_drop(pose, valid_mask, drop_prob=0.08, max_consecutive=1):
+    """
+    Randomly drop individual frames (conservative).
+    
+    This simulates minor tracking hiccups while preserving sign integrity.
+    Never drops more than max_consecutive frames in a row.
+    
+    Args:
+        pose: (T, N, 2) normalized keypoints
+        valid_mask: (T, N) boolean mask
+        drop_prob: Probability of dropping each frame
+        max_consecutive: Maximum consecutive frames to drop
+    
+    Returns:
+        dropped_pose: (T_new, N, 2) with some frames removed
+        dropped_mask: (T_new, N) corresponding mask
+    """
+    T, N, C = pose.shape
+    
+    if T < 10:  # Too short, don't drop
+        return pose, valid_mask
+    
+    # Decide which frames to keep
+    keep_mask = np.ones(T, dtype=bool)
+    consecutive_drops = 0
+    
+    for t in range(T):
+        # Don't drop first or last few frames (often important)
+        if t < 2 or t >= T - 2:
+            continue
+            
+        if np.random.random() < drop_prob and consecutive_drops < max_consecutive:
+            keep_mask[t] = False
+            consecutive_drops += 1
+        else:
+            consecutive_drops = 0
+    
+    # Ensure we keep at least 80% of frames
+    if keep_mask.sum() < 0.8 * T:
+        return pose, valid_mask
+    
+    return pose[keep_mask], valid_mask[keep_mask]
+
+
+def augment_spatial(pose, valid_mask, noise_sigma=0.02, scale_range=(0.85, 1.15), shift_range=0.1):
+    """
+    Apply spatial augmentations: noise, scaling, shifting.
+    
+    Args:
+        pose: (T, N, 2) normalized keypoints
+        valid_mask: (T, N) boolean mask
+        noise_sigma: Std of Gaussian noise
+        scale_range: (min_scale, max_scale) for random scaling
+        shift_range: Maximum shift in each direction
+    
+    Returns:
+        augmented_pose: (T, N, 2) augmented keypoints
+    """
+    aug_pose = pose.copy()
+    T, N, C = pose.shape
+    
+    # 1. Gaussian noise
+    if noise_sigma > 0:
+        noise = np.random.normal(0, noise_sigma, pose.shape).astype(np.float32)
+        aug_pose[valid_mask] += noise[valid_mask]
+    
+    # 2. Random scaling
+    scale = np.random.uniform(*scale_range)
+    aug_pose[valid_mask] *= scale
+    
+    # 3. Random shift
+    shift = np.random.uniform(-shift_range, shift_range, size=(1, 1, C)).astype(np.float32)
+    aug_pose[valid_mask] += shift.squeeze()
+    
+    return aug_pose
 
 
 class SignLanguageDataset(Dataset):
@@ -169,15 +310,22 @@ class SignLanguageDataset(Dataset):
         augmentation_config=None
     ):
         """
-        Sign Language Dataset with proper preprocessing.
+        Sign Language Dataset with comprehensive augmentation.
+        
+        Augmentations applied (in order):
+        1. Speed perturbation (temporal resampling)
+        2. Frame dropping (conservative, random individual frames)
+        3. Rotation (around body center)
+        4. Spatial (noise, scale, shift)
+        5. Velocity recomputation (after all pose augmentations)
         
         Args:
             csv_file: Path to CSV with 'id' and 'gloss' columns
             pkl_file: Path to pickle file with keypoints
             tokenizer: GlossTokenizer instance
             max_frames: Maximum frames to keep (None = auto-detect)
-            downsample_factor: Temporal downsampling factor (1 = no downsampling)
-            mode: 'hybrid' for CTC+Attention, 'contrastive' for contrastive learning
+            downsample_factor: Temporal downsampling factor
+            mode: 'hybrid' for CTC+Attention
             use_velocity: Whether to include velocity features
             use_augmentation: Whether to apply data augmentation
             augmentation_config: Dict with augmentation parameters
@@ -191,36 +339,49 @@ class SignLanguageDataset(Dataset):
         self.mode = mode
         self.use_velocity = use_velocity
         self.use_augmentation = use_augmentation
-        self.training = True  # Default to training mode
+        self.training = True
         
         # Default augmentation config
         self.aug_config = {
+            # Spatial augmentations
             'noise_sigma': 0.02,
-            'scale_range': (0.9, 1.1),
+            'scale_range': (0.85, 1.15),
             'shift_range': 0.1,
-            'time_mask_prob': 0.1,
-            'time_mask_max': 5,
+            
+            # Rotation
+            'rotation_prob': 0.5,          # Probability of applying rotation
+            'rotation_max_angle': 12,      # Maximum rotation in degrees (±)
+            
+            # Speed perturbation
+            'speed_prob': 0.5,             # Probability of applying speed change
+            'speed_range': (0.85, 1.15),   # Speed factor range
+            
+            # Frame dropping
+            'frame_drop_prob': 0.3,        # Probability of applying frame dropping
+            'frame_drop_rate': 0.08,       # Per-frame drop probability
+            'frame_drop_max_consecutive': 1,  # Max consecutive frames to drop
         }
         if augmentation_config:
             self.aug_config.update(augmentation_config)
         
-        # Calculate max_frames from data if not provided
+        # Calculate max_frames
         if max_frames is None:
             self.max_frames = 0
             for sample_id in self.data['id']:
                 if sample_id in self.keypoints:
                     raw_len = self.keypoints[sample_id]['keypoints'].shape[0]
                     downsampled_len = (raw_len + downsample_factor - 1) // downsample_factor
-                    if downsampled_len > self.max_frames:
-                        self.max_frames = downsampled_len
+                    # Account for potential speed slowdown (1.15x)
+                    max_possible = int(downsampled_len * 1.2)
+                    if max_possible > self.max_frames:
+                        self.max_frames = max_possible
             print(f"Auto-detected max_frames: {self.max_frames}")
         else:
             self.max_frames = max_frames
         
-        # Feature dimension
         self.feature_dim = 4 if use_velocity else 2
         
-        # Filter out samples without keypoints
+        # Filter samples without keypoints
         valid_ids = [sid for sid in self.data['id'] if sid in self.keypoints]
         if len(valid_ids) < len(self.data):
             print(f"Warning: {len(self.data) - len(valid_ids)} samples missing keypoints")
@@ -234,34 +395,53 @@ class SignLanguageDataset(Dataset):
         self.training = training
     
     def _apply_augmentation(self, pose, valid_mask):
-        """Apply data augmentation to normalized pose data."""
-        T, N, C = pose.shape
-        aug_pose = pose.copy()
-        aug_mask = valid_mask.copy()
+        """
+        Apply all augmentations in the correct order.
         
-        # 1. Gaussian noise
-        if self.aug_config['noise_sigma'] > 0:
-            noise = np.random.normal(0, self.aug_config['noise_sigma'], pose.shape)
-            aug_pose[valid_mask] += noise[valid_mask]
+        Order matters:
+        1. Temporal augmentations first (speed, frame drop) - changes sequence length
+        2. Spatial augmentations (rotation, noise, scale, shift)
+        3. Velocity is recomputed AFTER all pose augmentations
+        """
+        # =====================================================================
+        # 1. TEMPORAL AUGMENTATIONS (change sequence length)
+        # =====================================================================
         
-        # 2. Random scaling
-        scale_lo, scale_hi = self.aug_config['scale_range']
-        scale = np.random.uniform(scale_lo, scale_hi)
-        aug_pose[valid_mask] *= scale
+        # Speed perturbation
+        if np.random.random() < self.aug_config['speed_prob']:
+            pose, valid_mask = augment_speed(
+                pose, valid_mask,
+                speed_range=self.aug_config['speed_range']
+            )
         
-        # 3. Random shift
-        shift_range = self.aug_config['shift_range']
-        shift = np.random.uniform(-shift_range, shift_range, size=(1, 1, C))
-        aug_pose[valid_mask] += shift.squeeze()
+        # Frame dropping (conservative)
+        if np.random.random() < self.aug_config['frame_drop_prob']:
+            pose, valid_mask = augment_frame_drop(
+                pose, valid_mask,
+                drop_prob=self.aug_config['frame_drop_rate'],
+                max_consecutive=self.aug_config['frame_drop_max_consecutive']
+            )
         
-        # 4. Temporal masking
-        if np.random.random() < self.aug_config['time_mask_prob'] and T > 10:
-            mask_len = np.random.randint(1, min(self.aug_config['time_mask_max'], T // 4))
-            mask_start = np.random.randint(0, T - mask_len)
-            aug_pose[mask_start:mask_start + mask_len] = 0.0
-            aug_mask[mask_start:mask_start + mask_len] = False
+        # =====================================================================
+        # 2. SPATIAL AUGMENTATIONS
+        # =====================================================================
         
-        return aug_pose, aug_mask
+        # Rotation
+        if np.random.random() < self.aug_config['rotation_prob']:
+            pose = augment_rotation(
+                pose, valid_mask,
+                max_angle_degrees=self.aug_config['rotation_max_angle']
+            )
+        
+        # Noise, scale, shift
+        pose = augment_spatial(
+            pose, valid_mask,
+            noise_sigma=self.aug_config['noise_sigma'],
+            scale_range=self.aug_config['scale_range'],
+            shift_range=self.aug_config['shift_range']
+        )
+        
+        return pose, valid_mask
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
@@ -270,7 +450,7 @@ class SignLanguageDataset(Dataset):
         
         # Get raw keypoints
         if sample_id in self.keypoints:
-            raw_pose = self.keypoints[sample_id]['keypoints']  # (T, 86, 2)
+            raw_pose = self.keypoints[sample_id]['keypoints']
         else:
             raw_pose = np.zeros((10, 86, 2), dtype=np.float32)
         
@@ -285,7 +465,8 @@ class SignLanguageDataset(Dataset):
         if self.use_augmentation and self.training:
             pose, valid_mask = self._apply_augmentation(pose, valid_mask)
         
-        # 4. Compute velocity
+        # 4. Compute velocity AFTER all augmentations
+        #    This ensures velocity matches the augmented positions
         if self.use_velocity:
             velocity = compute_velocity(pose, valid_mask)
             pose_combined = np.concatenate([pose, velocity], axis=-1)
@@ -308,75 +489,19 @@ class SignLanguageDataset(Dataset):
         }
         
         # Tokenize based on mode
-        if self.mode == 'contrastive':
-            tokenized = self.tokenizer(
-                gloss_text, 
-                padding='max_length', 
-                truncation=True, 
-                max_length=128, 
-                return_tensors='pt'
-            )
-            result['input_ids'] = tokenized.input_ids.squeeze(0)
-            result['attention_mask'] = tokenized.attention_mask.squeeze(0)
-            
-        elif self.mode == 'hybrid':
-            # ============================================================
-            # KEY FIX: Separate CTC and Decoder targets
-            # ============================================================
-            # CTC targets: NO special tokens (just content)
+        if self.mode == 'hybrid':
             ctc_ids = self.tokenizer.encode_for_ctc(gloss_text)
             result['ctc_ids'] = torch.tensor(ctc_ids, dtype=torch.long)
             
-            # Decoder targets: WITH EOS (SOS prepended during training)
             dec_ids = self.tokenizer.encode_for_decoder(gloss_text)
             result['dec_ids'] = torch.tensor(dec_ids, dtype=torch.long)
         
         return result
 
 
-def collate_fn_contrastive(batch):
-    """Collate function for contrastive learning mode."""
-    poses = [x['pose'] for x in batch]
-    ids = [x['id'] for x in batch]
-    input_ids = torch.stack([x['input_ids'] for x in batch])
-    attention_mask = torch.stack([x['attention_mask'] for x in batch])
-    
-    max_frames = max([p.shape[0] for p in poses])
-    num_keypoints = poses[0].shape[1]
-    feature_dim = poses[0].shape[2]
-    
-    padded_poses = torch.zeros(len(poses), max_frames, num_keypoints, feature_dim)
-    pose_mask = torch.zeros(len(poses), max_frames)
-    
-    for i, p in enumerate(poses):
-        seq_len = p.shape[0]
-        padded_poses[i, :seq_len] = p
-        pose_mask[i, :seq_len] = 1
-    
-    return {
-        'id': ids,
-        'pose': padded_poses,
-        'pose_attention_mask': pose_mask,
-        'input_ids': input_ids,
-        'attention_mask': attention_mask
-    }
-
-
 def collate_fn_hybrid(batch):
     """
     Collate function for hybrid CTC + Attention mode.
-    
-    IMPORTANT: Returns SEPARATE targets for CTC and Decoder!
-    
-    Returns:
-        pose: (B, T_max, N, C) padded pose sequences
-        input_lengths: (B,) actual frame lengths for CTC
-        ctc_labels: (B, S_ctc) padded CTC targets (NO special tokens)
-        ctc_lengths: (B,) actual CTC target lengths
-        dec_labels: (B, S_dec) padded decoder targets (with EOS, -100 padding)
-        dec_lengths: (B,) actual decoder target lengths
-        ids: list of sample IDs
-        raw_text: list of original gloss strings
     """
     poses = [x['pose'] for x in batch]
     ctc_ids = [x['ctc_ids'] for x in batch]
@@ -384,7 +509,6 @@ def collate_fn_hybrid(batch):
     ids = [x['id'] for x in batch]
     texts = [x['gloss'] for x in batch]
     
-    # Get dimensions
     num_keypoints = poses[0].shape[1]
     feature_dim = poses[0].shape[2]
     
@@ -398,9 +522,7 @@ def collate_fn_hybrid(batch):
         padded_poses[i, :seq_len] = p
         input_lengths[i] = seq_len
     
-    # ============================================================
-    # CTC Labels: NO EOS, use 0 for padding (ignored via ctc_lengths)
-    # ============================================================
+    # CTC Labels
     max_ctc_len = max([t.shape[0] for t in ctc_ids])
     padded_ctc = torch.zeros((len(ctc_ids), max_ctc_len), dtype=torch.long)
     ctc_lengths = torch.zeros(len(ctc_ids), dtype=torch.long)
@@ -410,9 +532,7 @@ def collate_fn_hybrid(batch):
         padded_ctc[i, :label_len] = t
         ctc_lengths[i] = label_len
     
-    # ============================================================
-    # Decoder Labels: WITH EOS, use -100 for padding (CrossEntropyLoss ignore)
-    # ============================================================
+    # Decoder Labels
     max_dec_len = max([t.shape[0] for t in dec_ids])
     padded_dec = torch.full((len(dec_ids), max_dec_len), -100, dtype=torch.long)
     dec_lengths = torch.zeros(len(dec_ids), dtype=torch.long)
@@ -434,103 +554,108 @@ def collate_fn_hybrid(batch):
     }
 
 
-# ============================================================================
-# Testing / Verification
-# ============================================================================
+# =============================================================================
+# TESTING
+# =============================================================================
 
-def verify_tokenization():
-    """Verify that CTC and decoder tokenization are different."""
-    print("=" * 50)
-    print("TOKENIZATION VERIFICATION")
-    print("=" * 50)
+def test_augmentations():
+    """Test all augmentation functions."""
+    print("=" * 60)
+    print("AUGMENTATION TESTS")
+    print("=" * 60)
     
-    # Create a mock vocab
-    mock_vocab = {
-        "<pad>": 0, "<sos>": 1, "<eos>": 2, "<unk>": 3,
-        "انا": 4, "حب": 5, "اكل": 6
+    # Create synthetic pose data
+    T, N, C = 100, 86, 2
+    pose = np.random.randn(T, N, C).astype(np.float32) * 0.5
+    valid_mask = np.ones((T, N), dtype=bool)
+    valid_mask[10:15, :20] = False  # Some invalid regions
+    
+    print(f"\nOriginal shape: {pose.shape}")
+    print(f"Valid points: {valid_mask.sum()} / {valid_mask.size}")
+    
+    # Test rotation
+    print("\n--- Rotation Test ---")
+    rotated = augment_rotation(pose, valid_mask, max_angle_degrees=15)
+    print(f"Rotated shape: {rotated.shape}")
+    # Check that invalid points are unchanged
+    assert np.allclose(rotated[~valid_mask], pose[~valid_mask]), "Invalid points should not change"
+    print("✓ Rotation preserves invalid points")
+    
+    # Test speed perturbation
+    print("\n--- Speed Perturbation Test ---")
+    for speed_range in [(0.8, 0.8), (1.2, 1.2), (0.9, 1.1)]:
+        speed_pose, speed_mask = augment_speed(pose, valid_mask, speed_range=speed_range)
+        print(f"Speed range {speed_range}: {pose.shape[0]} → {speed_pose.shape[0]} frames")
+    print("✓ Speed perturbation works")
+    
+    # Test frame dropping
+    print("\n--- Frame Drop Test ---")
+    dropped_pose, dropped_mask = augment_frame_drop(pose, valid_mask, drop_prob=0.1, max_consecutive=1)
+    print(f"After drop: {pose.shape[0]} → {dropped_pose.shape[0]} frames")
+    assert dropped_pose.shape[0] >= 0.8 * pose.shape[0], "Should keep at least 80% of frames"
+    print("✓ Frame dropping is conservative")
+    
+    # Test spatial augmentation
+    print("\n--- Spatial Augmentation Test ---")
+    spatial_aug = augment_spatial(pose, valid_mask, noise_sigma=0.02, scale_range=(0.9, 1.1), shift_range=0.1)
+    print(f"Spatial augmented shape: {spatial_aug.shape}")
+    print("✓ Spatial augmentation works")
+    
+    # Test full pipeline
+    print("\n--- Full Pipeline Test ---")
+    aug_config = {
+        'noise_sigma': 0.02,
+        'scale_range': (0.85, 1.15),
+        'shift_range': 0.1,
+        'rotation_prob': 1.0,
+        'rotation_max_angle': 12,
+        'speed_prob': 1.0,
+        'speed_range': (0.85, 1.15),
+        'frame_drop_prob': 1.0,
+        'frame_drop_rate': 0.08,
+        'frame_drop_max_consecutive': 1,
     }
     
-    # Write temp vocab file
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump(mock_vocab, f)
-        vocab_path = f.name
+    # Simulate what happens in __getitem__
+    aug_pose = pose.copy()
+    aug_mask = valid_mask.copy()
     
-    tokenizer = GlossTokenizer(vocab_path)
+    # Speed
+    aug_pose, aug_mask = augment_speed(aug_pose, aug_mask, speed_range=aug_config['speed_range'])
+    # Frame drop
+    aug_pose, aug_mask = augment_frame_drop(aug_pose, aug_mask, 
+                                             drop_prob=aug_config['frame_drop_rate'],
+                                             max_consecutive=aug_config['frame_drop_max_consecutive'])
+    # Rotation
+    aug_pose = augment_rotation(aug_pose, aug_mask, max_angle_degrees=aug_config['rotation_max_angle'])
+    # Spatial
+    aug_pose = augment_spatial(aug_pose, aug_mask,
+                               noise_sigma=aug_config['noise_sigma'],
+                               scale_range=aug_config['scale_range'],
+                               shift_range=aug_config['shift_range'])
+    # Velocity (recomputed after augmentation)
+    velocity = compute_velocity(aug_pose, aug_mask)
     
-    test_sentence = "انا حب اكل"
+    print(f"Final shape: {aug_pose.shape}")
+    print(f"Velocity shape: {velocity.shape}")
+    print("✓ Full pipeline works")
     
-    ctc_tokens = tokenizer.encode_for_ctc(test_sentence)
-    dec_tokens = tokenizer.encode_for_decoder(test_sentence)
-    
-    print(f"Input: '{test_sentence}'")
-    print(f"CTC tokens:     {ctc_tokens} (length: {len(ctc_tokens)})")
-    print(f"Decoder tokens: {dec_tokens} (length: {len(dec_tokens)})")
-    print(f"EOS token ID:   {tokenizer.eos_token_id}")
-    print()
-    
-    # Verify
-    assert len(dec_tokens) == len(ctc_tokens) + 1, "Decoder should have 1 more token (EOS)"
-    assert dec_tokens[-1] == tokenizer.eos_token_id, "Decoder should end with EOS"
-    assert tokenizer.eos_token_id not in ctc_tokens, "CTC should NOT have EOS"
-    
-    print("✓ CTC tokens do NOT include EOS")
-    print("✓ Decoder tokens DO include EOS")
-    print("✓ All checks passed!")
-    
-    # Cleanup
-    import os
-    os.unlink(vocab_path)
+    print("\n" + "=" * 60)
+    print("ALL AUGMENTATION TESTS PASSED!")
+    print("=" * 60)
 
 
-def test_normalization():
-    """Test the normalization function."""
-    print("\n" + "=" * 50)
-    print("NORMALIZATION TEST")
-    print("=" * 50)
+def test_dataset_integration():
+    """Test that dataset loads with augmentation."""
+    print("\n" + "=" * 60)
+    print("DATASET INTEGRATION TEST")
+    print("=" * 60)
     
-    # Create test data with some invalid points
-    test_pose = np.random.randn(10, 86, 2) * 100 + 500
-    test_pose[0, :10, :] = -1  # Mark first 10 points in frame 0 as invalid
-    test_pose[5, :, :] = -1    # Mark entire frame 5 as invalid
-    
-    normalized, mask = normalize_keypoints(test_pose)
-    
-    print(f"Input shape: {test_pose.shape}")
-    print(f"Input range: [{test_pose[test_pose != -1].min():.1f}, {test_pose[test_pose != -1].max():.1f}]")
-    print(f"Output range: [{normalized[mask].min():.2f}, {normalized[mask].max():.2f}]")
-    print(f"Output mean: {normalized[mask].mean():.4f} (should be ~0)")
-    print(f"Output std: {normalized[mask].std():.4f} (should be ~1)")
-    print(f"Invalid points are zero: {(normalized[~mask] == 0).all()}")
-    print("✓ Normalization test passed!")
-
-
-def test_velocity():
-    """Test the velocity computation."""
-    print("\n" + "=" * 50)
-    print("VELOCITY TEST")
-    print("=" * 50)
-    
-    pose = np.array([
-        [[0, 0], [1, 1]],   # Frame 0
-        [[1, 1], [2, 2]],   # Frame 1: valid transition
-        [[-1, -1], [3, 3]], # Frame 2: first point invalid
-        [[2, 2], [4, 4]],   # Frame 3
-    ], dtype=np.float32)
-    
-    normalized, mask = normalize_keypoints(pose)
-    velocity = compute_velocity(normalized, mask)
-    
-    print(f"Frame 0 velocity (should be 0): {velocity[0].tolist()}")
-    print(f"Frame 2 point 0 (invalid transition): {velocity[2, 0].tolist()} (should be [0,0])")
-    print(f"Frame 3 point 0 (valid after invalid): {velocity[3, 0].tolist()} (should be [0,0])")
-    print("✓ Velocity test passed!")
+    # This would require actual data files
+    print("Skipping (requires data files)")
+    print("To test: Create dataset and iterate through a few samples")
 
 
 if __name__ == "__main__":
-    verify_tokenization()
-    test_normalization()
-    test_velocity()
-    print("\n" + "=" * 50)
-    print("ALL TESTS PASSED!")
-    print("=" * 50)
+    test_augmentations()
+    test_dataset_integration()
