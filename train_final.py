@@ -243,7 +243,8 @@ def train():
     # 4. Loss Functions
     # =========================================================================
     ctc_criterion = nn.CTCLoss(blank=tokenizer.vocab_size, zero_infinity=True)
-    ce_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    # Label smoothing helps prevent overfitting
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
 
     # =========================================================================
     # 5. Optimizer & Scheduler
@@ -521,6 +522,9 @@ def train():
         print(f"Model saved to: {args.output_dir}/best_model")
         print("=" * 60)
 
+    accelerator.wait_for_everyone()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 if __name__ == "__main__":
     train()

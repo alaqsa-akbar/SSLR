@@ -2,14 +2,15 @@
   "model_type": "pose_encoder",
   "num_keypoints": 86,
   "channels": 2,
-  "hidden_dim": 768,
-  "num_layers": 6,
+  "hidden_dim": 512,
+  "num_layers": 4,
   "num_heads": 8,
-  "dropout": 0.2,
+  "dropout": 0.3,
   "projection_dim": 512,
   "gcn_layers": 2,
-  "gcn_hidden": 256,
+  "gcn_hidden": 128,
   "num_decoder_layers": 2,
   "vocab_size": 687,
-  "use_dual_stream": true
+  "use_dual_stream": true,
+  "use_attention_pool": true
 }

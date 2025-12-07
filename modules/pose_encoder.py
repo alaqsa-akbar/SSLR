@@ -21,7 +21,8 @@ class PoseEncoderConfig(PretrainedConfig):
         gcn_hidden=256,
         num_decoder_layers=2,
         vocab_size=None,
-        use_dual_stream=True,  # New: separate pose and velocity streams
+        use_dual_stream=True,  # Separate pose and velocity streams
+        use_attention_pool=True,  # NEW: Use attention instead of mean pooling
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -37,6 +38,7 @@ class PoseEncoderConfig(PretrainedConfig):
         self.num_decoder_layers = num_decoder_layers
         self.vocab_size = vocab_size
         self.use_dual_stream = use_dual_stream
+        self.use_attention_pool = use_attention_pool
 
 
 class RMSNorm(nn.Module):
@@ -86,6 +88,142 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
 
 # ==========================================
+# Attention Pooling Modules
+# ==========================================
+class SpatialAttentionPool(nn.Module):
+    """
+    Learns which keypoints are important for each frame.
+    Replaces mean pooling over spatial dimension.
+    
+    Input:  (B, T, N_keypoints, H)
+    Output: (B, T, H)
+    """
+    def __init__(self, hidden_dim, num_keypoints):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 4, 1)
+        )
+        # Learnable keypoint importance prior
+        self.keypoint_bias = nn.Parameter(torch.zeros(num_keypoints))
+        
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, N, H) features per keypoint
+        Returns:
+            (B, T, H) pooled features
+        """
+        B, T, N, H = x.shape
+        
+        # Compute attention scores
+        scores = self.attention(x).squeeze(-1)  # (B, T, N)
+        scores = scores + self.keypoint_bias  # Add learnable bias per keypoint
+        
+        # Softmax over keypoints
+        weights = F.softmax(scores, dim=-1)  # (B, T, N)
+        
+        # Weighted sum
+        pooled = (x * weights.unsqueeze(-1)).sum(dim=2)  # (B, T, H)
+        
+        return pooled
+
+
+class TemporalAttentionPool(nn.Module):
+    """
+    Learns which frames are important for sequence-level representation.
+    Useful for classification or contrastive learning.
+    
+    Input:  (B, T, H)
+    Output: (B, H)
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 4, 1)
+        )
+        
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (B, T, H) sequence features
+            mask: (B, T) boolean mask for valid frames
+        Returns:
+            (B, H) pooled sequence representation
+        """
+        # Compute attention scores
+        scores = self.attention(x).squeeze(-1)  # (B, T)
+        
+        # Mask invalid frames
+        if mask is not None:
+            scores = scores.masked_fill(~mask.bool(), float('-inf'))
+        
+        # Softmax over time
+        weights = F.softmax(scores, dim=-1)  # (B, T)
+        
+        # Weighted sum
+        pooled = (x * weights.unsqueeze(-1)).sum(dim=1)  # (B, H)
+        
+        return pooled, weights  # Return weights for visualization
+
+
+class MultiHeadTemporalAttentionPool(nn.Module):
+    """
+    Multi-head version of temporal attention pooling.
+    Different heads can focus on different aspects (e.g., hand motion vs face).
+    
+    Input:  (B, T, H)
+    Output: (B, H)
+    """
+    def __init__(self, hidden_dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Learnable query for pooling
+        self.pool_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
+        
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (B, T, H)
+            mask: (B, T) boolean mask
+        Returns:
+            (B, H) pooled representation
+        """
+        B, T, H = x.shape
+        
+        # Expand pool query for batch
+        q = self.pool_query.expand(B, -1, -1)  # (B, 1, H)
+        q = self.query(q).view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        k = self.key(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.value(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Attention
+        attn_mask = None
+        if mask is not None:
+            attn_mask = mask.view(B, 1, 1, T).expand(-1, self.num_heads, 1, -1)
+            attn_mask = (~attn_mask.bool()).float() * -1e9
+        
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        attn = attn.transpose(1, 2).contiguous().view(B, 1, H)
+        
+        out = self.out_proj(attn).squeeze(1)  # (B, H)
+        return self.norm(out)
+
+
+# ==========================================
 # Graph Convolution Layers
 # ==========================================
 class GraphConvolution(nn.Module):
@@ -123,12 +261,14 @@ class GroupGCN(nn.Module):
     """
     Group-specific Graph Convolution Network.
     Processes a specific body part (hand, face, body) with its own adjacency.
+    Uses attention pooling instead of mean pooling over keypoints.
     """
-    def __init__(self, in_channels, hidden_dim, out_dim, num_layers, keypoint_indices, adjacency_pairs, dropout=0.1):
+    def __init__(self, in_channels, hidden_dim, out_dim, num_layers, keypoint_indices, adjacency_pairs, dropout=0.1, use_attention_pool=True):
         super().__init__()
         
         self.keypoint_indices = keypoint_indices
         self.num_keypoints = len(keypoint_indices)
+        self.use_attention_pool = use_attention_pool
         
         # Build adjacency matrix for this group
         adj = self._build_adjacency(adjacency_pairs)
@@ -147,6 +287,10 @@ class GroupGCN(nn.Module):
         self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(out_dim)
+        
+        # Attention pooling over keypoints (learns which keypoints matter)
+        if use_attention_pool:
+            self.spatial_pool = SpatialAttentionPool(out_dim, self.num_keypoints)
         
     def _build_adjacency(self, pairs):
         """Build adjacency matrix from pairs of connected keypoints."""
@@ -179,8 +323,13 @@ class GroupGCN(nn.Module):
             if i < len(self.layers) - 1:
                 group_x = self.dropout(self.act(group_x))
         
-        # Pool over keypoints (spatial mean pooling)
-        pooled = group_x.mean(dim=2)  # (B, T, out_dim)
+        # Pool over keypoints
+        if self.use_attention_pool:
+            # Attention pooling - learns which keypoints are important
+            pooled = self.spatial_pool(group_x)  # (B, T, out_dim)
+        else:
+            # Mean pooling - treats all keypoints equally
+            pooled = group_x.mean(dim=2)  # (B, T, out_dim)
         
         return self.norm(pooled)
 
@@ -189,8 +338,9 @@ class GroupedGCNEncoder(nn.Module):
     """
     Encoder with separate GCNs for each body part group.
     Groups: right_hand, left_hand, face, body
+    Uses attention pooling to learn which keypoints matter most.
     """
-    def __init__(self, in_channels, hidden_dim, gcn_hidden, num_gcn_layers, dropout=0.1):
+    def __init__(self, in_channels, hidden_dim, gcn_hidden, num_gcn_layers, dropout=0.1, use_attention_pool=True):
         super().__init__()
         
         # Per-group output dimension (will be concatenated)
@@ -213,25 +363,25 @@ class GroupedGCNEncoder(nn.Module):
         body_indices = list(range(70, 86))
         body_pairs = self._get_body_pairs()
         
-        # Create group-specific GCNs
+        # Create group-specific GCNs with attention pooling
         self.right_hand_gcn = GroupGCN(
             in_channels, gcn_hidden, group_out_dim, num_gcn_layers,
-            right_hand_indices, right_hand_pairs, dropout
+            right_hand_indices, right_hand_pairs, dropout, use_attention_pool
         )
         
         self.left_hand_gcn = GroupGCN(
             in_channels, gcn_hidden, group_out_dim, num_gcn_layers,
-            left_hand_indices, left_hand_pairs, dropout
+            left_hand_indices, left_hand_pairs, dropout, use_attention_pool
         )
         
         self.face_gcn = GroupGCN(
             in_channels, gcn_hidden, group_out_dim, num_gcn_layers,
-            face_indices, face_pairs, dropout
+            face_indices, face_pairs, dropout, use_attention_pool
         )
         
         self.body_gcn = GroupGCN(
             in_channels, gcn_hidden, group_out_dim, num_gcn_layers,
-            body_indices, body_pairs, dropout
+            body_indices, body_pairs, dropout, use_attention_pool
         )
         
         # Fusion layer after concatenation
@@ -315,9 +465,9 @@ class GroupedGCNEncoder(nn.Module):
 class DualStreamGroupedEncoder(nn.Module):
     """
     Dual-stream encoder with separate pose and velocity streams.
-    Each stream uses GroupedGCN, then features are fused.
+    Each stream uses GroupedGCN with attention pooling, then features are fused.
     """
-    def __init__(self, hidden_dim, gcn_hidden, num_gcn_layers, dropout=0.1):
+    def __init__(self, hidden_dim, gcn_hidden, num_gcn_layers, dropout=0.1, use_attention_pool=True):
         super().__init__()
         
         # Pose stream (x, y coordinates) - 2 channels
@@ -326,7 +476,8 @@ class DualStreamGroupedEncoder(nn.Module):
             hidden_dim=hidden_dim,
             gcn_hidden=gcn_hidden,
             num_gcn_layers=num_gcn_layers,
-            dropout=dropout
+            dropout=dropout,
+            use_attention_pool=use_attention_pool
         )
         
         # Velocity stream (vx, vy) - 2 channels  
@@ -335,7 +486,8 @@ class DualStreamGroupedEncoder(nn.Module):
             hidden_dim=hidden_dim,
             gcn_hidden=gcn_hidden,
             num_gcn_layers=num_gcn_layers,
-            dropout=dropout
+            dropout=dropout,
+            use_attention_pool=use_attention_pool
         )
         
         # Fusion: concatenate pose and velocity features, then project
@@ -481,7 +633,9 @@ class PoseEncoder(PreTrainedModel):
     Improved Pose Encoder with:
     - Grouped GCN (separate processing for hands, face, body)
     - Dual-stream (pose + velocity)
+    - Spatial Attention Pooling (learns which keypoints matter)
     - Transformer for temporal modeling
+    - Optional auxiliary output for dual CTC supervision
     """
     config_class = PoseEncoderConfig
     
@@ -489,13 +643,16 @@ class PoseEncoder(PreTrainedModel):
         super().__init__(config)
         self.config = config
         
-        # Spatial encoder: Dual-stream grouped GCN
+        # Spatial encoder: Dual-stream grouped GCN with attention pooling
+        use_attn_pool = getattr(config, 'use_attention_pool', True)
+        
         if config.use_dual_stream:
             self.spatial_encoder = DualStreamGroupedEncoder(
                 hidden_dim=config.hidden_dim,
                 gcn_hidden=config.gcn_hidden,
                 num_gcn_layers=config.gcn_layers,
-                dropout=config.dropout
+                dropout=config.dropout,
+                use_attention_pool=use_attn_pool
             )
         else:
             # Fallback: single stream with 4 channels
@@ -504,7 +661,8 @@ class PoseEncoder(PreTrainedModel):
                 hidden_dim=config.hidden_dim,
                 gcn_hidden=config.gcn_hidden,
                 num_gcn_layers=config.gcn_layers,
-                dropout=config.dropout
+                dropout=config.dropout,
+                use_attention_pool=use_attn_pool
             )
 
         # Temporal encoder: Transformer
@@ -512,25 +670,39 @@ class PoseEncoder(PreTrainedModel):
         self.layers = nn.ModuleList([TransformerLayer(config) for _ in range(config.num_layers)])
         self.final_norm = RMSNorm(config.hidden_dim)
         
-    def forward(self, x, attention_mask=None):
+    def forward(self, x, attention_mask=None, return_intermediate=False):
         """
         Args:
             x: (B, T, 86, 4) input with [x, y, vx, vy]
             attention_mask: (B, T) mask for valid frames
+            return_intermediate: If True, also return features after spatial encoding
+                                (for auxiliary CTC supervision)
         Returns:
-            (B, T, hidden_dim) encoded features
+            If return_intermediate=False:
+                (B, T, hidden_dim) encoded features
+            If return_intermediate=True:
+                (B, T, hidden_dim) final features,
+                (B, T, hidden_dim) intermediate features (after spatial encoder)
         """
         B, T, N, C = x.shape
         
         # Spatial encoding (grouped GCN with dual-stream)
-        x = self.spatial_encoder(x)  # (B, T, H)
+        spatial_out = self.spatial_encoder(x)  # (B, T, H)
+        
+        # Save for auxiliary output
+        intermediate = spatial_out
         
         # Temporal encoding (Transformer)
+        x = spatial_out
         cos, sin = self.rotary_emb(x, seq_len=T)
         for layer in self.layers:
             x = layer(x, cos, sin, attention_mask)
-            
-        return self.final_norm(x)
+        
+        final_out = self.final_norm(x)
+        
+        if return_intermediate:
+            return final_out, intermediate
+        return final_out
 
 
 class TinyAdvancedDecoder(nn.Module):

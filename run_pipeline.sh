@@ -109,7 +109,7 @@ python evaluate.py \
     --split dev \
     --batch_size 1 \
     --decode_method attention \
-    --num_beams 1 \
+    --num_beams 5 \
     --output_file ${FINAL_OUTPUT}/evaluation_attention.txt
 
 echo ""
