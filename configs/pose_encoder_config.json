@@ -9,7 +9,7 @@
   "projection_dim": 768,
   "gcn_layers": 2,
   "gcn_hidden": 256,
-  "num_decoder_layers": 2,
+  "num_decoder_layers": 8,
   "vocab_size": 687,
   "use_dual_stream": true,
   "use_attention_pool": true

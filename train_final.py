@@ -105,6 +105,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--freeze_encoder_epochs", type=int, default=0,
+                        help="Number of epochs to freeze encoder (0 = none)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -212,6 +214,7 @@ def train():
     config = PoseEncoderConfig.from_json_file(args.pose_config)
     
     # Load pretrained or initialize fresh
+    fresh_start = args.fresh_start
     if args.fresh_start or args.pretrained_encoder is None:
         if accelerator.is_main_process:
             print("Initializing random encoder")
@@ -224,6 +227,7 @@ def train():
         except Exception as e:
             if accelerator.is_main_process:
                 print(f"Warning: Could not load pretrained ({e}), initializing random")
+                fresh_start = True
             pose_encoder = PoseEncoder(config)
     
     model = HybridModel(
@@ -232,6 +236,13 @@ def train():
         num_decoder_layers=config.num_decoder_layers
     )
     
+    # Freeze encoder layers if specified
+    if args.freeze_encoder_epochs > 0 and not fresh_start:
+        if accelerator.is_main_process:
+            print(f"Freezing encoder for first {args.freeze_encoder_epochs} epochs")
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -278,6 +289,14 @@ def train():
         total_ctc = 0
         total_ce = 0
         num_batches = 0
+
+        if epoch == args.freeze_encoder_epochs:
+            # Unfreeze encoder
+            if accelerator.is_main_process:
+                print("Unfreezing encoder for fine-tuning")
+            unwrapped_model = accelerator.unwrap_model(model)
+            for param in unwrapped_model.encoder.parameters():
+                param.requires_grad = True
         
         if accelerator.is_main_process:
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
